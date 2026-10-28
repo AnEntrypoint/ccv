@@ -22,6 +22,9 @@ const LIVEKIT_PORT = 7880;
 const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
 const HEARD_URI = 'ccv://heard';
 const subscriptions = new Set();
+// Calls of voice_listen still waiting for speech, so a client that never receives channel
+// notifications can be woken by an utterance instead of polling voice_heard.
+const listeners = new Set();
 
 // Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
@@ -80,6 +83,13 @@ function quietLog(source, line) {
 
 function text(message) {
   return { content: [{ type: 'text', text: message }] };
+}
+
+// Hands an utterance to every waiting voice_listen call; one that asked for a newer cursor stays waiting.
+function wakeListeners(utterance) {
+  for (const listener of listeners) {
+    if (utterance.at > listener.after) listener.deliver(utterance);
+  }
 }
 
 // Starts the install once; later calls share its promise.
@@ -184,6 +194,7 @@ function startHostChild(config) {
         // Durable fallback for clients that do not deliver channel notifications:
         // one JSON object per utterance, tail-able by any agent that can only read files.
         appendFileSync(path.join(state.home, 'heard.jsonl'), `${JSON.stringify(utterance)}\n`);
+        wakeListeners(utterance);
         notifyHeard(utterance);
       }
       if (msg.type === 'spoke') {
@@ -257,6 +268,8 @@ function status() {
     livekit: state.livekit ? 'running (started by ccv)' : process.env.LIVEKIT_URL ? 'external' : 'stopped',
     host: state.host ? state.host.url : 'stopped',
     heard: state.heard.length,
+    waitingListeners: listeners.size,
+    channelHint: 'Speech reaches the session on its own only when Claude Code was started with --dangerously-load-development-channels server:ccv (the name after server: must match exactly, with no trailing character) and the startup dialog was accepted. Otherwise call voice_listen, which blocks until the user speaks.',
     logs: state.logs.slice(-20),
   }, null, 2);
 }
@@ -274,7 +287,7 @@ export async function main() {
     { name: 'ccv', version: '0.1.0' },
     {
       capabilities: { logging: {}, resources: { subscribe: true }, experimental: { 'claude/channel': {} } },
-      instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> and are spoken by the user in the voice room. Reply with voice_speak.',
+      instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> and are spoken by the user in the voice room. Reply with voice_speak. If they never arrive, the session was started without --dangerously-load-development-channels server:ccv; call voice_listen instead, which blocks until the user speaks.',
     },
   );
   server.registerResource(
@@ -347,6 +360,33 @@ export async function main() {
     description: 'Recent utterances transcribed from the room, oldest first.',
     inputSchema: { since: z.number().optional().describe('only utterances after this epoch ms') },
   }, async ({ since = 0 }) => text(JSON.stringify(state.heard.filter((u) => u.at > since), null, 2)));
+
+  // For sessions that never registered the channel handler, this is the push path: the call
+  // blocks until the user speaks, so a reply needs no polling loop to notice them.
+  server.registerTool('voice_listen', {
+    description: 'Wait for the next utterance in the room and return it, or {"timeout":true} after timeoutMs. Use this when speech does not arrive by itself; call it again after each reply to keep listening.',
+    inputSchema: {
+      after: z.number().optional().describe('only utterances after this epoch ms; defaults to everything heard so far'),
+      timeoutMs: z.number().optional().describe('give up after this long in ms (default 30000, max 300000)'),
+    },
+  }, async ({ after, timeoutMs = 30000 }, extra) => {
+    const cursor = after ?? state.heard.at(-1)?.at ?? 0;
+    const waiting = state.heard.find((u) => u.at > cursor);
+    if (waiting) return text(JSON.stringify(waiting));
+    return new Promise((resolve) => {
+      const give = Math.min(Math.max(timeoutMs, 1000), 300000);
+      const listener = { after: cursor, deliver: (u) => { stop(); resolve(text(JSON.stringify(u))); } };
+      function stop() {
+        clearTimeout(timer);
+        listeners.delete(listener);
+        extra?.signal?.removeEventListener('abort', cancel);
+      }
+      const timer = setTimeout(() => { stop(); resolve(text(JSON.stringify({ timeout: true, after: cursor }))); }, give);
+      const cancel = () => { stop(); resolve(text(JSON.stringify({ cancelled: true, after: cursor }))); };
+      listeners.add(listener);
+      extra?.signal?.addEventListener('abort', cancel, { once: true });
+    });
+  });
 
   await server.connect(new StdioServerTransport());
   log('ccv MCP server ready');

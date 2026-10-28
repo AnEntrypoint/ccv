@@ -4,7 +4,8 @@
   "description": "Voice stack MCP server: LiveKit room, speech-to-text and text-to-speech, run with npx",
   "type": "module",
   "bin": {
-    "ccv": "bin/ccv.mjs"
+    "ccv": "bin/ccv.mjs",
+    "ccv-claude": "bin/ccv-claude.mjs"
   },
   "files": [
     "bin",

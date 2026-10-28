@@ -4,11 +4,23 @@ Realtime voice for Claude Code: a LiveKit room you join from the browser, speech
 
 ## Use
 
-Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add ccv -- npx -y github:AnEntrypoint/ccv`), then from the session:
+Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add ccv -- npx -y github:AnEntrypoint/ccv`).
+
+Start Claude Code with the channel flag, so speech arrives in the session on its own:
+
+    npx -y --package github:AnEntrypoint/ccv ccv-claude
+
+That runs `claude --dangerously-load-development-channels server:ccv`, passing through any arguments. It exists because the name after `server:` is matched exactly and a stray character in a hand-typed flag silently matches no server; the equivalent by hand is:
+
+    claude --dangerously-load-development-channels server:ccv
+
+The name after `server:` must match the MCP server name exactly (`ccv`). A stray trailing character — including the carriage return a paste can carry — silently matches no server, the flag is ignored, and no speech is ever delivered. Custom channels are not on the approved allowlist, so `--channels` alone is not enough and the startup confirmation dialog has to be accepted. Nothing in the voice stack depends on this flag: a session that receives nothing can call `voice_listen`, which blocks until the user speaks.
+
+Then from the session:
 
 1. `voice_setup`: installs LiveKit and downloads the models in the background (about 1 GB once).
 2. `voice_start`: starts LiveKit (dev mode) and the voice host. Open the printed page (http://127.0.0.1:8800/) and click join.
-3. `voice_heard` lists what was said; `voice_speak` replies. Long replies stream sentence by sentence.
+3. `voice_heard` lists what was said; `voice_listen` waits for the next thing said; `voice_speak` replies. Long replies stream sentence by sentence.
 4. `voice_status` shows setup progress and recent logs; `voice_stop` shuts the stack down.
 
 Every utterance is also appended to `<CCV_HOME>/heard.jsonl` as one JSON object per line
@@ -43,4 +55,4 @@ When a spoken reply finishes playing, the server sends the same channel notifica
 
 ## Status
 
-Verified locally: models download with resume and checksum, LiveKit installs and passes its checksum, MCP tools list and start/stop, the host joins the room and serves the page. Not yet verified: a live conversation in the room (barge-in, long-form speech).
+Verified locally: models download with resume and checksum, LiveKit installs and passes its checksum, MCP tools list and start/stop, the host joins the room and serves the page, and a live conversation across two browser clients — long-form speech, sentence-by-sentence streaming, and barge-in interrupting a reply. Channel delivery into the session is the client's to grant: the flag above, the accepted dialog, and a session that runs long enough to register the handler.
