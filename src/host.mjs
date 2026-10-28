@@ -127,6 +127,8 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     if (!source) throw new Error('not connected to a room yet');
     const id = ++playbackId;
     const it = synthesizeStream(tts, text)[Symbol.asyncIterator]();
+    let frames = 0;
+    let peak = 0;
     let next = it.next();
     for (;;) {
       const { value, done } = await next;
@@ -139,11 +141,14 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
         const chunk = value.subarray(i, i + PER_TTS_FRAME);
         const padded = chunk.length === PER_TTS_FRAME ? chunk : Object.assign(new Int16Array(PER_TTS_FRAME), chunk);
         notePlaybackLevel(pcmDbfs(padded));
+        for (let k = 0; k < padded.length; k++) { const a = Math.abs(padded[k]); if (a > peak) peak = a; }
         await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, PER_TTS_FRAME));
+        frames++;
       }
     }
     if (id !== playbackId) it.return?.();
     if (id === playbackId) speakingUntil = Date.now() + ECHO_TAIL_MS;
+    log(`speak: ${frames} frames, peak ${peak}, ${id === playbackId ? 'complete' : 'interrupted'}`);
   }
 
   function transcribeQueued(pcm) {
@@ -222,6 +227,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
   source = new AudioSource(TTS_RATE, 1);
   const track = LocalAudioTrack.createAudioTrack('voice-host', source);
   await room.localParticipant.publishTrack(track, new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }));
+  log(`published ${track.sid} at ${TTS_RATE} Hz`);
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
