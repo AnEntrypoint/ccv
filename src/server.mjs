@@ -5,7 +5,7 @@
 //   voice_status  setup progress, host state, recent log lines
 //   voice_speak   say text in the room (streams per sentence)
 //   voice_heard   recent utterances the host transcribed
-import { mkdirSync, appendFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,9 @@ const HEARD_KEEP = 50;
 const LOG_KEEP = 200;
 const LIVEKIT_PORT = 7880;
 const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
+
+// Pushes each utterance to the client as it arrives; set once the MCP server exists.
+let notifyHeard = () => {};
 
 const state = {
   home: '',
@@ -37,6 +40,28 @@ function log(line) {
   if (state.logs.length > LOG_KEEP) state.logs.shift();
   if (state.home) appendFileSync(path.join(state.home, 'ccv.log'), `${stamped}\n`);
   console.error(stamped);
+}
+
+// Child PIDs survive only in this file, so a server killed without a clean stop cannot orphan them.
+function childrenFile() {
+  return path.join(state.home, 'children.json');
+}
+
+function recordChildren() {
+  writeFileSync(childrenFile(), JSON.stringify({ livekit: state.livekit?.pid ?? null, host: state.host?.child.pid ?? null }));
+}
+
+// Kills children a previous server left behind, identified by the PIDs it recorded.
+function reapStaleChildren() {
+  if (!existsSync(childrenFile())) return;
+  for (const [name, pid] of Object.entries(JSON.parse(readFileSync(childrenFile(), 'utf8')))) {
+    if (!pid) continue;
+    try {
+      process.kill(pid, 'SIGTERM');
+      log(`reaped stale ${name} pid ${pid} from an earlier server`);
+    } catch { /* already gone */ }
+  }
+  unlinkSync(childrenFile());
 }
 
 // Debug and info SDK and server chatter: kept in livekit.log for debugging, out of the status output.
@@ -122,7 +147,7 @@ async function startLiveKit(install) {
   const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => noisy(l) ? quietLog('livekit', l) : log(`livekit: ${l}`));
   child.stdout.on('data', relay);
   child.stderr.on('data', relay);
-  child.on('exit', (code) => { log(`livekit exited (${code})`); state.livekit = null; });
+  child.on('exit', (code) => { log(`livekit exited (${code})`); state.livekit = null; recordChildren(); });
   if (!(await waitForPort(LIVEKIT_PORT, 15000))) {
     child.kill();
     throw new Error(`LiveKit did not open port ${LIVEKIT_PORT}`);
@@ -140,6 +165,7 @@ function startHostChild(config) {
     const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => noisy(l) ? quietLog('host', l) : log(`host: ${l}`));
     child.stdout.on('data', relay);
     child.stderr.on('data', relay);
+    recordChildren();
     const pendingSpeech = new Map();
     let nextId = 0;
     child.on('message', (msg) => {
@@ -147,8 +173,10 @@ function startHostChild(config) {
       if (msg.type === 'ready') resolve({ child, url: msg.url, speak: (t) => speakVia(child, pendingSpeech, () => nextId++, t) });
       if (msg.type === 'error') reject(new Error(msg.message));
       if (msg.type === 'heard') {
-        state.heard.push({ at: msg.at, from: msg.from, text: msg.text });
+        const utterance = { at: msg.at, from: msg.from, text: msg.text };
+        state.heard.push(utterance);
         if (state.heard.length > HEARD_KEEP) state.heard.shift();
+        notifyHeard(utterance);
       }
       if (msg.type === 'spoke') {
         const done = pendingSpeech.get(msg.id);
@@ -159,6 +187,7 @@ function startHostChild(config) {
     child.on('exit', (code) => {
       log(`host exited (${code})`);
       state.host = null;
+      recordChildren();
       reject(new Error(`host exited (${code}) before ready`));
     });
   });
@@ -188,6 +217,7 @@ async function start() {
       throw new Error(`port ${LIVEKIT_PORT} is already in use; stop that server or set LIVEKIT_URL to use it`);
     }
     state.livekit = await startLiveKit(state.install);
+    recordChildren();
   }
   const port = Number(process.env.CCV_PORT ?? 8800);
   if (await portOpen(port)) throw new Error(`port ${port} is already in use; set CCV_PORT to another port`);
@@ -204,6 +234,7 @@ async function stop() {
   }
   state.livekit?.kill();
   state.livekit = null;
+  recordChildren();
   return 'voice stack stopped';
 }
 
@@ -226,10 +257,12 @@ export async function main() {
   const loaded = loadDotEnv(cwd);
   state.home = process.env.CCV_HOME ?? path.join(cwd, '.ccv');
   mkdirSync(state.home, { recursive: true });
+  reapStaleChildren();
   if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
   ensureSetup().catch(() => {});
 
-  const server = new McpServer({ name: 'ccv', version: '0.1.0' });
+  const server = new McpServer({ name: 'ccv', version: '0.1.0' }, { capabilities: { logging: {} } });
+  notifyHeard = (utterance) => server.server.sendLoggingMessage({ level: 'info', logger: 'ccv.voice', data: utterance }).catch(() => {});
 
   server.registerTool('voice_setup', {
     description: 'Install LiveKit and download the speech models in the background. Runs automatically at launch; use this only to retry after an error.',
@@ -274,4 +307,6 @@ export async function main() {
   const shutdown = async () => { await stop().catch(() => {}); process.exit(0); };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('SIGHUP', shutdown);
+  process.stdin.on('end', shutdown);
 }
