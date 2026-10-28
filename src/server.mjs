@@ -39,6 +39,15 @@ function log(line) {
   console.error(stamped);
 }
 
+// Debug and info SDK and server chatter: kept in livekit.log for debugging, out of the status output.
+function noisy(line) {
+  return /\t(DEBUG|INFO)\t/.test(line) || line.includes('"name":"lk-rtc"') || line.startsWith('Nvidia Decoder');
+}
+
+function quietLog(source, line) {
+  if (state.home) appendFileSync(path.join(state.home, 'livekit.log'), `${source}: ${line}\n`);
+}
+
 function text(message) {
   return { content: [{ type: 'text', text: message }] };
 }
@@ -110,7 +119,7 @@ async function startLiveKit(install) {
   const child = install.docker
     ? spawn('docker', ['run', '--rm', '-p', '7880:7880', '-p', '7881:7881', '-p', '7882:7882/udp', 'livekit/livekit-server', '--dev', '--bind', '0.0.0.0'], { stdio: ['ignore', 'pipe', 'pipe'] })
     : spawn(install.cmd, ['--dev', '--bind', '127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => log(`livekit: ${l}`));
+  const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => noisy(l) ? quietLog('livekit', l) : log(`livekit: ${l}`));
   child.stdout.on('data', relay);
   child.stderr.on('data', relay);
   child.on('exit', (code) => { log(`livekit exited (${code})`); state.livekit = null; });
@@ -128,13 +137,13 @@ function startHostChild(config) {
       env: { ...process.env, CCV_HOST_CONFIG: JSON.stringify(config) },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
-    const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => log(`host: ${l}`));
+    const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => noisy(l) ? quietLog('host', l) : log(`host: ${l}`));
     child.stdout.on('data', relay);
     child.stderr.on('data', relay);
     const pendingSpeech = new Map();
     let nextId = 0;
     child.on('message', (msg) => {
-      if (msg.type === 'log') log(`host: ${msg.line}`);
+      if (msg.type === 'log') (noisy(msg.line) ? quietLog('host', msg.line) : log(`host: ${msg.line}`));
       if (msg.type === 'ready') resolve({ child, url: msg.url, speak: (t) => speakVia(child, pendingSpeech, () => nextId++, t) });
       if (msg.type === 'error') reject(new Error(msg.message));
       if (msg.type === 'heard') {
