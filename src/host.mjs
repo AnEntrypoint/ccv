@@ -142,7 +142,9 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
       for (let i = 0; i < value.length; i += PER_TTS_FRAME) {
         if (id !== playbackId) break;
         const chunk = value.subarray(i, i + PER_TTS_FRAME);
-        const padded = chunk.length === PER_TTS_FRAME ? chunk : Object.assign(new Int16Array(PER_TTS_FRAME), chunk);
+        // Fresh buffer per frame: AudioFrame sends its whole ArrayBuffer, so a subarray view would ship the wrong samples.
+        const padded = new Int16Array(PER_TTS_FRAME);
+        padded.set(chunk);
         notePlaybackLevel(pcmDbfs(padded));
         for (let k = 0; k < padded.length; k++) { const a = Math.abs(padded[k]); if (a > peak) peak = a; }
         await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, PER_TTS_FRAME));
