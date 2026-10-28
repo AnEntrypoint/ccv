@@ -8,7 +8,20 @@ import path from 'node:path';
 
 export const SAMPLE_RATE = 24000;
 const MAX_PHONEMES = 510;
-const GAP_SAMPLES = SAMPLE_RATE / 5;
+const PUNCT = new Set([',', '.', '!', '?', ';', ':', '—', '…']);
+const ONES = ['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'];
+const TENS = ['', '', 'twenty','thirty','forty','fifty','sixty','seventy','eighty','ninety'];
+
+// Cardinal words for non-negative integers below one billion, e.g. 2015 -> two thousand fifteen.
+export function numberToWords(n) {
+  if (n < 20) return ONES[n];
+  if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + ONES[n % 10] : '');
+  if (n < 1000) return ONES[Math.floor(n / 100)] + ' hundred' + (n % 100 ? ' ' + numberToWords(n % 100) : '');
+  for (const [unit, name] of [[1e9, 'billion'], [1e6, 'million'], [1e3, 'thousand']]) {
+    if (n >= unit) return numberToWords(Math.floor(n / unit)) + ' ' + name + (n % unit ? ' ' + numberToWords(n % unit) : '');
+  }
+  return String(n);
+}
 
 function loadLexicon(files) {
   const words = new Map();
@@ -43,24 +56,30 @@ function espeakWord(word) {
   return out;
 }
 
+// Words go through the lexicon (espeak for unknowns). Digit runs are spelled out first, and
+// punctuation is kept as its own token so the model gets the same pauses and intonation cues.
 function phonemizeSentence(words, sentence) {
-  const parts = [];
-  const flush = (word) => {
-    if (!word) return;
+  const expanded = sentence.replace(/\d+/g, (d) => (d.length > 12 ? d.split('').join(' ') : numberToWords(Number(d))));
+  const out = [];
+  const pushWord = (word) => {
     let ps = lookup(words, word);
     if (ps === undefined) {
       const letters = word.replace(/'/g, '');
       if (letters) ps = espeakWord(letters);
     }
-    if (ps) parts.push(ps);
+    if (ps) out.push(ps);
   };
   let word = '';
-  for (const ch of sentence) {
-    if (/[A-Za-z]/.test(ch) || ch === "'") word += ch;
-    else { flush(word); word = ''; }
+  for (const ch of expanded) {
+    if (/[A-Za-z']/.test(ch)) { word += ch; continue; }
+    if (word) { pushWord(word); word = ''; }
+    if (PUNCT.has(ch)) {
+      if (out.length) out[out.length - 1] += ch;
+      else out.push(ch);
+    }
   }
-  flush(word);
-  return parts.join(' ');
+  if (word) pushWord(word);
+  return out.join(' ');
 }
 
 // Splits on newlines, and after . ! ? followed by whitespace.
@@ -129,8 +148,8 @@ export async function synthesize(model, text, speed = 1.0) {
       const c = Math.max(-1, Math.min(1, float[i]));
       pcm[i] = Math.round(c * 32767);
     }
-    chunks.push(pcm, new Int16Array(GAP_SAMPLES));
-    total += pcm.length + GAP_SAMPLES;
+    chunks.push(pcm);
+    total += pcm.length;
   }
   const out = new Int16Array(total);
   let off = 0;
