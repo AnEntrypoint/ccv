@@ -3,13 +3,26 @@
   "version": "0.1.0",
   "description": "Voice stack MCP server: LiveKit room, speech-to-text and text-to-speech, run with npx",
   "type": "module",
-  "bin": { "ccv": "bin/ccv.mjs" },
-  "files": ["bin", "src", "stack", "README.md"],
-  "scripts": { "start": "node bin/ccv.mjs" },
+  "bin": {
+    "ccv": "bin/ccv.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "stack",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/ccv.mjs"
+  },
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/AnEntrypoint/ccv.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnEntrypoint/ccv.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "onnxruntime-node": "^1.24.3",
     "zod": "^4.6.7"
   }
 }
