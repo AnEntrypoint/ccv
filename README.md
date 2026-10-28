@@ -12,8 +12,7 @@ Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add cc
 4. `voice_status` shows setup progress and recent logs; `voice_stop` shuts the stack down.
 
 Every utterance is also appended to `<CCV_HOME>/heard.jsonl` as one JSON object per line
-(`at`, `from`, `text`). Clients that gate MCP channel notifications (Claude Code
-refuses them on third-party providers) can follow that file instead.
+(`at`, `from`, `text`). Clients that do not deliver MCP channel notifications can follow that file instead.
 
 ## Configuration
 

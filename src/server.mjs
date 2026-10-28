@@ -179,9 +179,8 @@ function startHostChild(config) {
         const utterance = { at: msg.at, from: msg.from, text: msg.text };
         state.heard.push(utterance);
         if (state.heard.length > HEARD_KEEP) state.heard.shift();
-        // Durable fallback for clients that gate channel notifications (Claude Code
-        // refuses them on third-party providers): one JSON object per utterance,
-        // tail-able by any agent that can only read files.
+        // Durable fallback for clients that do not deliver channel notifications:
+        // one JSON object per utterance, tail-able by any agent that can only read files.
         appendFileSync(path.join(state.home, 'heard.jsonl'), `${JSON.stringify(utterance)}\n`);
         notifyHeard(utterance);
       }
