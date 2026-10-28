@@ -4,7 +4,7 @@ Realtime voice for Claude Code: a LiveKit room you join from the browser, speech
 
 ## Use
 
-Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add ccv -- npx -y ccv`), then from the session:
+Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add ccv -- npx -y github:AnEntrypoint/ccv`), then from the session:
 
 1. `voice_setup`: installs LiveKit and downloads the models in the background (about 1 GB once).
 2. `voice_start`: starts LiveKit (dev mode) and the voice host. Open the printed page (http://127.0.0.1:8800/) and click join.
