@@ -14,11 +14,14 @@ import { ensureLiveKit, ensureModels, modelsReady } from './install.mjs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { loadDotEnv } from './env.mjs';
 const HEARD_KEEP = 50;
 const LOG_KEEP = 200;
 const LIVEKIT_PORT = 7880;
 const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
+const HEARD_URI = 'ccv://heard';
+const subscriptions = new Set();
 
 // Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
@@ -264,11 +267,27 @@ export async function main() {
   const server = new McpServer(
     { name: 'ccv', version: '0.1.0' },
     {
-      capabilities: { logging: {}, experimental: { 'claude/channel': {} } },
+      capabilities: { logging: {}, resources: { subscribe: true }, experimental: { 'claude/channel': {} } },
       instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> and are spoken by the user in the voice room. Reply with voice_speak.',
     },
   );
+  server.registerResource(
+    'heard',
+    HEARD_URI,
+    { description: 'Recent voice utterances. Subscribe for resources/updated on each new utterance; read for the recent list.', mimeType: 'application/json' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(state.heard, null, 2) }] }),
+  );
+  server.server.setRequestHandler(SubscribeRequestSchema, async ({ params }) => {
+    subscriptions.add(params.uri);
+    return {};
+  });
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async ({ params }) => {
+    subscriptions.delete(params.uri);
+    return {};
+  });
   notifyHeard = (utterance) => {
+    // Standard resource notification: clients subscribed to ccv://heard re-read the list.
+    if (subscriptions.has(HEARD_URI)) server.server.sendResourceUpdated({ uri: HEARD_URI }).catch(() => {});
     // Standard logging notification: any MCP client that renders logs gets it.
     server.sendLoggingMessage({ level: 'notice', logger: 'ccv', data: utterance }).catch(() => {});
     // Claude Code channel push: clients that do not declare claude/channel ignore it.
