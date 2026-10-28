@@ -20,7 +20,7 @@ const LOG_KEEP = 200;
 const LIVEKIT_PORT = 7880;
 const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
 
-// Pushes each utterance to the client as it arrives; set once the MCP server exists.
+// Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
 
 const state = {
@@ -261,8 +261,11 @@ export async function main() {
   if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
   ensureSetup().catch(() => {});
 
-  const server = new McpServer({ name: 'ccv', version: '0.1.0' }, { capabilities: { logging: {} } });
-  notifyHeard = (utterance) => server.server.sendLoggingMessage({ level: 'info', logger: 'ccv.voice', data: utterance }).catch(() => {});
+  const server = new McpServer({ name: 'ccv', version: '0.1.0' }, { capabilities: { experimental: { 'claude/channel': {} } } });
+  notifyHeard = ({ at, from, text: heard }) => server.server.notification({
+    method: 'notifications/claude/channel',
+    params: { content: heard, meta: { source: 'ccv', from, at: String(at) } },
+  }).catch(() => {});
 
   server.registerTool('voice_setup', {
     description: 'Install LiveKit and download the speech models in the background. Runs automatically at launch; use this only to retry after an error.',
