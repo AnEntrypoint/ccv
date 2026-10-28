@@ -1,6 +1,6 @@
 # ccv
 
-Realtime voice for Claude Code: a LiveKit room you join from the browser, speech-to-text (Underdog Bark 3.0 Clean), and text-to-speech (Paradee). Runs as an MCP server through `npx ccv`.
+Realtime voice for Claude Code: a LiveKit room you join from the browser, speech-to-text (Underdog Bark 3.0 Clean), and text-to-speech (Paradee). Runs as an MCP server through `npx -y github:AnEntrypoint/ccv`.
 
 ## Use
 
