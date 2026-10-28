@@ -4,6 +4,7 @@
 //   voice_stop    stop the host and the LiveKit server this process started
 //   voice_status  setup progress, host state, recent log lines
 //   voice_speak   say text in the room (streams per sentence)
+//   voice_interrupt  cut off the reply playing right now
 //   voice_heard   recent utterances the host transcribed
 import { mkdirSync, appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
@@ -359,12 +360,29 @@ export async function main() {
   }, async () => text(status()));
 
   server.registerTool('voice_speak', {
-    description: 'Say text in the voice room. Long text streams sentence by sentence.',
+    description: 'Say text in the voice room. Long text streams sentence by sentence. Returns when playback ends, or early if the user or voice_interrupt cuts it off.',
     inputSchema: { text: z.string().min(1) },
-  }, async ({ text: spoken }) => {
+  }, async ({ text: spoken }, extra) => {
     if (!state.host) return text('voice host is not running; call voice_start');
-    await state.host.speak(spoken);
+    // A call the client cancelled must take its audio with it: otherwise the reply keeps
+    // playing into a session that has already moved on, and the user cannot stop it.
+    const stop = () => state.host?.child.send({ type: 'interrupt' });
+    extra?.signal?.addEventListener('abort', stop, { once: true });
+    try {
+      await state.host.speak(spoken);
+    } finally {
+      extra?.signal?.removeEventListener('abort', stop);
+    }
     return text('spoken');
+  });
+
+  server.registerTool('voice_interrupt', {
+    description: 'Cut off the reply playing in the voice room right now. The voice_speak call that started it returns early.',
+    inputSchema: {},
+  }, async () => {
+    if (!state.host) return text('voice host is not running; call voice_start');
+    state.host.child.send({ type: 'interrupt' });
+    return text('interrupted');
   });
 
   server.registerTool('voice_heard', {

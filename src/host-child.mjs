@@ -1,5 +1,6 @@
 // Runs the voice host in a child process so native library output on stdout cannot corrupt the
-// MCP stdio stream. Parent sends {type:'speak', id, text} and receives {type:'ready'|'heard'|'spoke'|'done'|'error'|'log'}.
+// MCP stdio stream. Parent sends {type:'speak', id, text} or {type:'interrupt'} and receives
+// {type:'ready'|'heard'|'spoke'|'done'|'error'|'log'}.
 // Exits when the parent's IPC channel closes, so a dead MCP server never leaves the host holding its port.
 import { startVoiceHost } from './host.mjs';
 
@@ -34,6 +35,7 @@ try {
         send({ type: 'spoke', id: msg.id, error: err.message });
       }
     }
+    if (msg.type === 'interrupt') host.interrupt();
     if (msg.type === 'stop') await shutdown();
   });
 } catch (err) {

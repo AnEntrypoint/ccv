@@ -20,12 +20,18 @@ Then from the session:
 
 1. `voice_setup`: installs LiveKit and downloads the models in the background (about 1 GB once).
 2. `voice_start`: starts LiveKit (dev mode) and the voice host. Open the printed page (http://127.0.0.1:8800/) and click join.
-3. `voice_heard` lists what was said; `voice_listen` waits for the next thing said; `voice_speak` replies. Long replies stream sentence by sentence.
+3. `voice_heard` lists what was said; `voice_listen` waits for the next thing said; `voice_speak` replies. Long replies stream sentence by sentence, and `voice_interrupt` cuts off the one playing.
 4. `voice_status` shows setup progress and recent logs; `voice_stop` shuts the stack down.
 
 Every utterance is also appended to `<CCV_HOME>/heard.jsonl` as one JSON object per line
 (`at`, `from`, `text`). Clients that do not deliver MCP channel notifications can follow that file instead.
 When a spoken reply finishes playing, the server sends the same channel notification with `event: done`.
+
+## Interrupting a reply
+
+Talk over a reply, or press **Interrupt** on the page, and it stops. The page decides this locally: it measures the microphone and the reply it is playing on the same audio clock, silences playback the moment the user wins, and posts `/interrupt` to the host, which drops the queued audio and returns the in-flight `voice_speak` early. Deciding it in the browser is what makes it reliable — the mic there has already been echo-cancelled by the browser, and the decision needs no network round trip. The gate is measured, not assumed: the first 350 ms of each reply set the level the mic hears while the user is silent (near silence on a headset, closer to our own level on a speaker), and the user has to beat that by 9 dB.
+
+The host keeps its own energy-based barge-in as a fallback for clients that cannot decide locally. It is deliberately hard to trip, because a microphone that hears the speaker would otherwise cancel every reply the moment it starts. A cancelled `voice_speak` call also stops its own audio.
 ## Configuration
 
 `.env` in the current directory is read at start. Process environment variables win over it.
@@ -40,8 +46,8 @@ When a spoken reply finishes playing, the server sends the same channel notifica
 | `CCV_HOME` | `./.ccv` | Where binaries and models live |
 | `END_SILENCE_MS` | `800` | Quiet time that ends an utterance (debounce only, nothing is force-sent) |
 | `MIN_SPEECH_MS` | `250` | Shorter bursts (clicks, knocks) are dropped |
-| `BARGE_DBFS` / `BARGE_MS` | `-30` / `250` | Level and duration that interrupt playback |
-| `ECHO_MARGIN_DB` | `8` | dB a barge-in must beat our own playback by, so a mic that hears the speaker cannot cancel every reply |
+| `BARGE_DBFS` / `BARGE_MS` | `-30` / `250` | Host fallback barge-in: level and duration that interrupt playback |
+| `ECHO_MARGIN_DB` | `8` | Host fallback barge-in: dB the mic must beat our own playback by, so a mic that hears the speaker cannot cancel every reply |
 
 ## Platforms
 

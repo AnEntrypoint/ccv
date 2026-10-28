@@ -1,7 +1,9 @@
 // Voice host: joins the LiveKit room, transcribes every remote mic and screen-audio track with
 // Underdog Bark (STT), speaks replies with Paradee (TTS), and serves the browser page.
 // Endpointing is energy-based with debounce only: an utterance ends after END_SILENCE_MS of quiet,
-// and never before it, so nothing is force-sent. Barge-in cuts playback when the raw level stays loud.
+// and never before it, so nothing is force-sent. Quiet is measured against the room's own floor and
+// the absolute thresholds are floors on that, so a noisy room still closes an utterance. Barge-in cuts
+// playback when the raw level stays loud.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -34,6 +36,13 @@ const MAX_UTTERANCE_FRAMES = Number(process.env.MAX_UTTERANCE_MS ?? 15000) / CAP
 const PLAYBACK_REF_MS = 400;
 const MIN_SPEECH_FRAMES = Number(process.env.MIN_SPEECH_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(process.env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
+// Speech gates are measured against the room's own floor. In a noisy room an absolute
+// threshold sits below the noise, so nothing ever counts as silence and every utterance
+// runs to the cap, landing the transcript 15 seconds after it was spoken.
+const FLOOR_FRAMES = Number(process.env.FLOOR_MS ?? 800) / CAPTURE_FRAME_MS;
+const SPEECH_OVER_DB = Number(process.env.SPEECH_OVER_DB ?? 12);
+const CONTINUE_OVER_DB = Number(process.env.CONTINUE_OVER_DB ?? 6);
+const SILENCE_DBFS = -100;
 const PRE_ROLL_FRAMES = 20;
 const ECHO_TAIL_MS = 800;
 
@@ -71,6 +80,19 @@ function makeDecimator() {
       pos = (pos + 1) % LP_TAPS;
     }
     return out;
+  };
+}
+
+// Quietest level of the last FLOOR_FRAMES, the room's own floor as this track hears it.
+// A track that sends digital silence would otherwise put -Infinity in the window and
+// collapse the gates back to the absolute thresholds.
+function makeFloor() {
+  const levels = new Float64Array(FLOOR_FRAMES).fill(SILENCE_DBFS);
+  let pos = 0;
+  return (db) => {
+    levels[pos] = db > SILENCE_DBFS ? db : SILENCE_DBFS;
+    pos = (pos + 1) % FLOOR_FRAMES;
+    return Math.min(...levels);
   };
 }
 
@@ -163,7 +185,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
     return job;
   }
 
-  async function handleUtterance(frames, identity, wallMs = 0, peakDb = -Infinity) {
+  async function handleUtterance(frames, identity, wallMs = 0, peakDb = -Infinity, floorDb = -Infinity) {
     const total = frames.reduce((n, f) => n + f.length, 0);
     const pcm = new Int16Array(total);
     let off = 0;
@@ -173,7 +195,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
       const heard = (await transcribeQueued(pcm)).trim();
       const sttMs = Date.now() - sttStarted;
       if (!heard) return;
-      log(`[${identity}] heard (${(total / STT_RATE).toFixed(1)} s audio, ${sttMs} ms stt, ${wallMs} ms wall, peak ${peakDb.toFixed(0)} dBFS): ${heard}`);
+      log(`[${identity}] heard (${(total / STT_RATE).toFixed(1)} s audio, ${sttMs} ms stt, ${wallMs} ms wall, peak ${peakDb.toFixed(0)} dBFS, floor ${floorDb.toFixed(0)} dBFS): ${heard}`);
       onHeard?.(heard, identity);
     } catch (err) {
       log(`utterance failed: ${err.message}`);
@@ -183,16 +205,21 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
   async function listen(track, identity) {
     const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
     const decimate = makeDecimator();
+    const floor = makeFloor();
     const preRoll = [];
     let utter = null;
     let utterStart = 0;
     let utterPeakDb = -Infinity;
+    let utterFloorDb = Infinity;
     let silent = 0;
     let voiced = 0;
     let bargeCount = 0;
     for await (const frame of stream) {
       const pcm16k = decimate(frame.data);
       const db = rawDbfs(frame.data);
+      const floorDb = floor(db);
+      const openDb = Math.max(ENERGY_DBFS, floorDb + SPEECH_OVER_DB);
+      const continueDb = Math.max(ENERGY_CONTINUE_DBFS, floorDb + CONTINUE_OVER_DB);
       if (Date.now() < speakingUntil) {
         const bargeGate = Math.max(BARGE_DBFS, playbackRefDbfs() + ECHO_MARGIN_DB);
         bargeCount = db >= bargeGate ? bargeCount + 1 : 0;
@@ -208,20 +235,24 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
       if (utter) {
         utter.push(pcm16k);
         if (db > utterPeakDb) utterPeakDb = db;
-        silent = db >= ENERGY_CONTINUE_DBFS ? 0 : silent + 1;
-        if (db >= ENERGY_DBFS) voiced++;
+        if (floorDb < utterFloorDb) utterFloorDb = floorDb;
+        silent = db >= continueDb ? 0 : silent + 1;
+        if (db >= openDb) voiced++;
         if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTERANCE_FRAMES) {
           const done = utter;
           const peak = utterPeakDb;
+          const room = utterFloorDb;
           utter = null;
           utterPeakDb = -Infinity;
-          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart, peak);
+          utterFloorDb = Infinity;
+          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart, peak, room);
           voiced = 0;
         }
-      } else if (db >= ENERGY_DBFS) {
+      } else if (db >= openDb) {
         utter = [...preRoll, pcm16k];
         utterStart = Date.now();
         utterPeakDb = db;
+        utterFloorDb = floorDb;
         silent = 0;
         voiced = 1;
       }
@@ -254,6 +285,14 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
       return res.end(JSON.stringify({ url: livekit.url, token: await browser.toJwt() }));
     }
     if (req.method === 'GET' && url.pathname === '/health') return res.end('ok');
+    // A client that can see and silence its own playback decides barge-in locally and calls this:
+    // it beats the energy gate above, which a normal microphone cannot clear under our own voice.
+    if (req.method === 'POST' && url.pathname === '/interrupt') {
+      interruptPlayback();
+      log('interrupt: reply cleared by client');
+      res.setHeader('content-type', 'application/json');
+      return res.end('{"ok":true}');
+    }
     if (req.method === 'POST' && url.pathname === '/speak') {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -283,6 +322,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
   return {
     url: `http://127.0.0.1:${port}/`,
     speak,
+    interrupt: interruptPlayback,
     async close() {
       interruptPlayback();
       server.close();
