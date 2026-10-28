@@ -11,6 +11,10 @@ Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add cc
 3. `voice_heard` lists what was said; `voice_speak` replies. Long replies stream sentence by sentence.
 4. `voice_status` shows setup progress and recent logs; `voice_stop` shuts the stack down.
 
+Every utterance is also appended to `<CCV_HOME>/heard.jsonl` as one JSON object per line
+(`at`, `from`, `text`). Clients that gate MCP channel notifications (Claude Code
+refuses them on third-party providers) can follow that file instead.
+
 ## Configuration
 
 `.env` in the current directory is read at start. Process environment variables win over it.
