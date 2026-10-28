@@ -5,17 +5,16 @@
 //   voice_status  setup progress, host state, recent log lines
 //   voice_speak   say text in the room (streams per sentence)
 //   voice_heard   recent utterances the host transcribed
-import { mkdirSync, appendFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fork, spawn } from 'node:child_process';
+import { ensureLiveKit, ensureModels, modelsReady } from './install.mjs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { loadDotEnv } from './env.mjs';
-import { ensureLiveKit, ensureModels, modelsReady } from './install.mjs';
-
 const HEARD_KEEP = 50;
 const LOG_KEEP = 200;
 const LIVEKIT_PORT = 7880;
@@ -23,7 +22,7 @@ const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
 
 const state = {
   home: '',
-  setup: { status: 'idle', error: null, promise: null },
+  setup: { status: 'idle', error: null, promise: null, detail: '' },
   install: null,
   livekit: null,
   host: null,
@@ -34,6 +33,7 @@ const state = {
 function log(line) {
   const stamped = `${new Date().toISOString()} ${line}`;
   state.logs.push(stamped);
+  if (state.setup.status === 'running') state.setup.detail = line;
   if (state.logs.length > LOG_KEEP) state.logs.shift();
   if (state.home) appendFileSync(path.join(state.home, 'ccv.log'), `${stamped}\n`);
   console.error(stamped);
@@ -46,7 +46,7 @@ function text(message) {
 // Starts the install once; later calls share its promise.
 function ensureSetup() {
   if (state.setup.promise) return state.setup.promise;
-  state.setup = { status: 'running', error: null, promise: null };
+  state.setup = { status: 'running', error: null, promise: null, detail: 'starting' };
   state.setup.promise = (async () => {
     try {
       if (!modelsReady(state.home)) await ensureModels(state.home, log);
@@ -62,6 +62,30 @@ function ensureSetup() {
     }
   })();
   return state.setup.promise;
+}
+
+// Bytes written so far for each model download still in progress.
+function downloadProgress() {
+  const root = path.join(state.home, 'models');
+  if (!existsSync(root)) return [];
+  const parts = [];
+  for (const dir of readdirSync(root)) {
+    for (const f of readdirSync(path.join(root, dir))) {
+      if (f.endsWith('.part')) parts.push(`${dir}/${f.slice(0, -5)}: ${(statSync(path.join(root, dir, f)).size / 1e6).toFixed(0)} MB`);
+    }
+  }
+  return parts;
+}
+
+// Opens the voice page in the default browser. Failure is ignored: the URL is also returned to the caller.
+function openPage(url) {
+  if (process.env.CCV_NO_BROWSER) return;
+  const [cmd, args] = process.platform === 'darwin' ? ['open', [url]]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+    : ['xdg-open', [url]];
+  const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+  child.on('error', () => {});
+  child.unref();
 }
 
 function portOpen(port) {
@@ -160,6 +184,7 @@ async function start() {
   if (await portOpen(port)) throw new Error(`port ${port} is already in use; set CCV_PORT to another port`);
   const host = await startHostChild({ home: state.home, livekit, port });
   state.host = host;
+  openPage(host.url);
   return `voice host running. Open ${host.url} and click join.`;
 }
 
@@ -176,7 +201,9 @@ async function stop() {
 function status() {
   return JSON.stringify({
     setup: state.setup.status,
+    setupDetail: state.setup.detail,
     setupError: state.setup.error,
+    downloading: downloadProgress(),
     modelsReady: state.home ? modelsReady(state.home) : false,
     livekit: state.livekit ? 'running (started by ccv)' : process.env.LIVEKIT_URL ? 'external' : 'stopped',
     host: state.host ? state.host.url : 'stopped',
@@ -191,11 +218,12 @@ export async function main() {
   state.home = process.env.CCV_HOME ?? path.join(cwd, '.ccv');
   mkdirSync(state.home, { recursive: true });
   if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
+  ensureSetup().catch(() => {});
 
   const server = new McpServer({ name: 'ccv', version: '0.1.0' });
 
   server.registerTool('voice_setup', {
-    description: 'Install LiveKit and download the speech models in the background. Returns immediately; poll voice_status.',
+    description: 'Install LiveKit and download the speech models in the background. Runs automatically at launch; use this only to retry after an error.',
     inputSchema: {},
   }, async () => {
     ensureSetup().catch(() => {});
@@ -203,7 +231,7 @@ export async function main() {
   });
 
   server.registerTool('voice_start', {
-    description: 'Start LiveKit and the voice host, waiting for setup if it is still running.',
+    description: 'Start LiveKit and the voice host, waiting for setup if it is still running, and open the voice page in the browser.',
     inputSchema: {},
   }, async () => text(await start()));
 
