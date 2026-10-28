@@ -26,6 +26,7 @@ Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add cc
 | `END_SILENCE_MS` | `800` | Quiet time that ends an utterance (debounce only, nothing is force-sent) |
 | `MIN_SPEECH_MS` | `250` | Shorter bursts (clicks, knocks) are dropped |
 | `BARGE_DBFS` / `BARGE_MS` | `-30` / `250` | Level and duration that interrupt playback |
+| `ECHO_MARGIN_DB` | `8` | dB a barge-in must beat our own playback by, so a mic that hears the speaker cannot cancel every reply |
 
 ## Platforms
 

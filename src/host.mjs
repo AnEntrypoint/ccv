@@ -25,6 +25,10 @@ const ENERGY_DBFS = Number(process.env.ENERGY_DBFS ?? -40);
 const ENERGY_CONTINUE_DBFS = Number(process.env.ENERGY_CONTINUE_DBFS ?? -46);
 const BARGE_DBFS = Number(process.env.BARGE_DBFS ?? -30);
 const BARGE_FRAMES = Number(process.env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
+// Barge-in must beat our own playback by this many dB; a microphone that hears the
+// speaker (or a remote-desktop loopback) would otherwise cancel every reply on onset.
+const ECHO_MARGIN_DB = Number(process.env.ECHO_MARGIN_DB ?? 8);
+const PLAYBACK_REF_MS = 400;
 const MIN_SPEECH_FRAMES = Number(process.env.MIN_SPEECH_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(process.env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;
@@ -67,6 +71,15 @@ function makeDecimator() {
   };
 }
 
+// Level of one frame we are about to send, in dBFS on the 16-bit scale.
+function pcmDbfs(pcm16) {
+  if (pcm16.length === 0) return -Infinity;
+  let sum = 0;
+  for (let i = 0; i < pcm16.length; i++) sum += pcm16[i] * pcm16[i];
+  const rms = Math.sqrt(sum / pcm16.length) / 32768;
+  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+}
+
 function rawDbfs(pcm48) {
   let sum = 0;
   for (let i = 0; i < pcm48.length; i++) sum += pcm48[i] * pcm48[i];
@@ -86,10 +99,26 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
   let source;
   let sttChain = Promise.resolve();
 
+  // Levels of the audio just sent, so barge-in can be told apart from the microphone
+  // hearing our own playback through speakers or a remote desktop loopback.
+  const playbackLevels = [];
+  function notePlaybackLevel(db) {
+    const now = Date.now();
+    playbackLevels.push({ t: now, db });
+    while (playbackLevels.length > 0 && now - playbackLevels[0].t > PLAYBACK_REF_MS) playbackLevels.shift();
+  }
+  function playbackRefDbfs() {
+    const now = Date.now();
+    let ref = -Infinity;
+    for (const entry of playbackLevels) if (now - entry.t <= PLAYBACK_REF_MS && entry.db > ref) ref = entry.db;
+    return ref;
+  }
+
   // Cancels the current reply: drops queued audio and stops the speak loop.
   function interruptPlayback() {
     playbackId++;
     speakingUntil = 0;
+    playbackLevels.length = 0;
     source?.clearQueue();
   }
 
@@ -109,6 +138,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
         if (id !== playbackId) break;
         const chunk = value.subarray(i, i + PER_TTS_FRAME);
         const padded = chunk.length === PER_TTS_FRAME ? chunk : Object.assign(new Int16Array(PER_TTS_FRAME), chunk);
+        notePlaybackLevel(pcmDbfs(padded));
         await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, PER_TTS_FRAME));
       }
     }
@@ -149,7 +179,8 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
       const pcm16k = decimate(frame.data);
       const db = rawDbfs(frame.data);
       if (Date.now() < speakingUntil) {
-        bargeCount = db >= BARGE_DBFS ? bargeCount + 1 : 0;
+        const bargeGate = Math.max(BARGE_DBFS, playbackRefDbfs() + ECHO_MARGIN_DB);
+        bargeCount = db >= bargeGate ? bargeCount + 1 : 0;
         if (bargeCount < BARGE_FRAMES) {
           preRoll.push(pcm16k);
           if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
