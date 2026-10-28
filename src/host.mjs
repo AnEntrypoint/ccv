@@ -28,6 +28,9 @@ const BARGE_FRAMES = Number(process.env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
 // Barge-in must beat our own playback by this many dB; a microphone that hears the
 // speaker (or a remote-desktop loopback) would otherwise cancel every reply on onset.
 const ECHO_MARGIN_DB = Number(process.env.ECHO_MARGIN_DB ?? 8);
+// A capture that never drops below the continue threshold (a noisy room, or a mic
+// that hears the speaker) would otherwise stay open forever and swallow every reply.
+const MAX_UTTERANCE_FRAMES = Number(process.env.MAX_UTTERANCE_MS ?? 15000) / CAPTURE_FRAME_MS;
 const PLAYBACK_REF_MS = 400;
 const MIN_SPEECH_FRAMES = Number(process.env.MIN_SPEECH_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(process.env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
@@ -157,7 +160,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     return job;
   }
 
-  async function handleUtterance(frames, identity, wallMs = 0) {
+  async function handleUtterance(frames, identity, wallMs = 0, peakDb = -Infinity) {
     const total = frames.reduce((n, f) => n + f.length, 0);
     const pcm = new Int16Array(total);
     let off = 0;
@@ -167,7 +170,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
       const heard = (await transcribeQueued(pcm)).trim();
       const sttMs = Date.now() - sttStarted;
       if (!heard) return;
-      log(`[${identity}] heard (${(total / STT_RATE).toFixed(1)} s audio, ${sttMs} ms stt, ${wallMs} ms wall): ${heard}`);
+      log(`[${identity}] heard (${(total / STT_RATE).toFixed(1)} s audio, ${sttMs} ms stt, ${wallMs} ms wall, peak ${peakDb.toFixed(0)} dBFS): ${heard}`);
       onHeard?.(heard, identity);
     } catch (err) {
       log(`utterance failed: ${err.message}`);
@@ -180,6 +183,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     const preRoll = [];
     let utter = null;
     let utterStart = 0;
+    let utterPeakDb = -Infinity;
     let silent = 0;
     let voiced = 0;
     let bargeCount = 0;
@@ -200,17 +204,21 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
       }
       if (utter) {
         utter.push(pcm16k);
+        if (db > utterPeakDb) utterPeakDb = db;
         silent = db >= ENERGY_CONTINUE_DBFS ? 0 : silent + 1;
         if (db >= ENERGY_DBFS) voiced++;
-        if (silent >= END_SILENCE_FRAMES) {
+        if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTERANCE_FRAMES) {
           const done = utter;
+          const peak = utterPeakDb;
           utter = null;
-          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart);
+          utterPeakDb = -Infinity;
+          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart, peak);
           voiced = 0;
         }
       } else if (db >= ENERGY_DBFS) {
         utter = [...preRoll, pcm16k];
         utterStart = Date.now();
+        utterPeakDb = db;
         silent = 0;
         voiced = 1;
       }
