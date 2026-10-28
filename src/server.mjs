@@ -1,0 +1,240 @@
+// MCP stdio server for the ccv voice stack. Tools:
+//   voice_setup   install LiveKit and download models in the background (returns at once)
+//   voice_start   wait for setup, start LiveKit (unless LIVEKIT_URL is set) and the voice host
+//   voice_stop    stop the host and the LiveKit server this process started
+//   voice_status  setup progress, host state, recent log lines
+//   voice_speak   say text in the room (streams per sentence)
+//   voice_heard   recent utterances the host transcribed
+import { mkdirSync, appendFileSync } from 'node:fs';
+import net from 'node:net';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { fork, spawn } from 'node:child_process';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { loadDotEnv } from './env.mjs';
+import { ensureLiveKit, ensureModels, modelsReady } from './install.mjs';
+
+const HEARD_KEEP = 50;
+const LOG_KEEP = 200;
+const LIVEKIT_PORT = 7880;
+const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
+
+const state = {
+  home: '',
+  setup: { status: 'idle', error: null, promise: null },
+  install: null,
+  livekit: null,
+  host: null,
+  heard: [],
+  logs: [],
+};
+
+function log(line) {
+  const stamped = `${new Date().toISOString()} ${line}`;
+  state.logs.push(stamped);
+  if (state.logs.length > LOG_KEEP) state.logs.shift();
+  if (state.home) appendFileSync(path.join(state.home, 'ccv.log'), `${stamped}\n`);
+  console.error(stamped);
+}
+
+function text(message) {
+  return { content: [{ type: 'text', text: message }] };
+}
+
+// Starts the install once; later calls share its promise.
+function ensureSetup() {
+  if (state.setup.promise) return state.setup.promise;
+  state.setup = { status: 'running', error: null, promise: null };
+  state.setup.promise = (async () => {
+    try {
+      if (!modelsReady(state.home)) await ensureModels(state.home, log);
+      if (!process.env.LIVEKIT_URL) state.install = await ensureLiveKit(state.home, log);
+      state.setup.status = 'done';
+      log('setup complete');
+    } catch (err) {
+      state.setup.status = 'error';
+      state.setup.error = err.message;
+      state.setup.promise = null;
+      log(`setup failed: ${err.message}`);
+      throw err;
+    }
+  })();
+  return state.setup.promise;
+}
+
+function portOpen(port) {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1');
+    sock.once('connect', () => { sock.destroy(); resolve(true); });
+    sock.once('error', () => resolve(false));
+  });
+}
+
+async function waitForPort(port, ms) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (await portOpen(port)) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+// Starts LiveKit in dev mode. Docker is used when the binary install fell back to a container.
+async function startLiveKit(install) {
+  const child = install.docker
+    ? spawn('docker', ['run', '--rm', '-p', '7880:7880', '-p', '7881:7881', '-p', '7882:7882/udp', 'livekit/livekit-server', '--dev', '--bind', '0.0.0.0'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    : spawn(install.cmd, ['--dev', '--bind', '127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => log(`livekit: ${l}`));
+  child.stdout.on('data', relay);
+  child.stderr.on('data', relay);
+  child.on('exit', (code) => { log(`livekit exited (${code})`); state.livekit = null; });
+  if (!(await waitForPort(LIVEKIT_PORT, 15000))) {
+    child.kill();
+    throw new Error(`LiveKit did not open port ${LIVEKIT_PORT}`);
+  }
+  return child;
+}
+
+// Forks the voice host and resolves once it has joined the room and serves the page.
+function startHostChild(config) {
+  return new Promise((resolve, reject) => {
+    const child = fork(HOST_CHILD, [], {
+      env: { ...process.env, CCV_HOST_CONFIG: JSON.stringify(config) },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    const relay = (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => log(`host: ${l}`));
+    child.stdout.on('data', relay);
+    child.stderr.on('data', relay);
+    const pendingSpeech = new Map();
+    let nextId = 0;
+    child.on('message', (msg) => {
+      if (msg.type === 'log') log(`host: ${msg.line}`);
+      if (msg.type === 'ready') resolve({ child, url: msg.url, speak: (t) => speakVia(child, pendingSpeech, () => nextId++, t) });
+      if (msg.type === 'error') reject(new Error(msg.message));
+      if (msg.type === 'heard') {
+        state.heard.push({ at: msg.at, from: msg.from, text: msg.text });
+        if (state.heard.length > HEARD_KEEP) state.heard.shift();
+      }
+      if (msg.type === 'spoke') {
+        const done = pendingSpeech.get(msg.id);
+        pendingSpeech.delete(msg.id);
+        if (done) msg.error ? done.reject(new Error(msg.error)) : done.resolve();
+      }
+    });
+    child.on('exit', (code) => {
+      log(`host exited (${code})`);
+      state.host = null;
+      reject(new Error(`host exited (${code}) before ready`));
+    });
+  });
+}
+
+function speakVia(child, pending, nextId, spoken) {
+  const id = nextId();
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    child.send({ type: 'speak', id, text: spoken });
+  });
+}
+
+async function start() {
+  if (state.host) return `already running at ${state.host.url}`;
+  await ensureSetup();
+  const external = process.env.LIVEKIT_URL;
+  const livekit = {
+    url: external ?? `ws://127.0.0.1:${LIVEKIT_PORT}`,
+    key: process.env.LIVEKIT_API_KEY ?? 'devkey',
+    secret: process.env.LIVEKIT_API_SECRET ?? 'secret',
+    room: process.env.LK_ROOM ?? 'lk-voice',
+    identity: process.env.LK_IDENTITY ?? 'voice-host',
+  };
+  if (!external) {
+    if (await portOpen(LIVEKIT_PORT)) {
+      throw new Error(`port ${LIVEKIT_PORT} is already in use; stop that server or set LIVEKIT_URL to use it`);
+    }
+    state.livekit = await startLiveKit(state.install);
+  }
+  const port = Number(process.env.CCV_PORT ?? 8800);
+  if (await portOpen(port)) throw new Error(`port ${port} is already in use; set CCV_PORT to another port`);
+  const host = await startHostChild({ home: state.home, livekit, port });
+  state.host = host;
+  return `voice host running. Open ${host.url} and click join.`;
+}
+
+async function stop() {
+  if (state.host) {
+    state.host.child.send({ type: 'stop' });
+    state.host = null;
+  }
+  state.livekit?.kill();
+  state.livekit = null;
+  return 'voice stack stopped';
+}
+
+function status() {
+  return JSON.stringify({
+    setup: state.setup.status,
+    setupError: state.setup.error,
+    modelsReady: state.home ? modelsReady(state.home) : false,
+    livekit: state.livekit ? 'running (started by ccv)' : process.env.LIVEKIT_URL ? 'external' : 'stopped',
+    host: state.host ? state.host.url : 'stopped',
+    heard: state.heard.length,
+    logs: state.logs.slice(-20),
+  }, null, 2);
+}
+
+export async function main() {
+  const cwd = process.cwd();
+  const loaded = loadDotEnv(cwd);
+  state.home = process.env.CCV_HOME ?? path.join(cwd, '.ccv');
+  mkdirSync(state.home, { recursive: true });
+  if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
+
+  const server = new McpServer({ name: 'ccv', version: '0.1.0' });
+
+  server.registerTool('voice_setup', {
+    description: 'Install LiveKit and download the speech models in the background. Returns immediately; poll voice_status.',
+    inputSchema: {},
+  }, async () => {
+    ensureSetup().catch(() => {});
+    return text('setup started in the background; poll voice_status');
+  });
+
+  server.registerTool('voice_start', {
+    description: 'Start LiveKit and the voice host, waiting for setup if it is still running.',
+    inputSchema: {},
+  }, async () => text(await start()));
+
+  server.registerTool('voice_stop', {
+    description: 'Stop the voice host and the LiveKit server this process started.',
+    inputSchema: {},
+  }, async () => text(await stop()));
+
+  server.registerTool('voice_status', {
+    description: 'Setup progress, host and LiveKit state, and recent log lines.',
+    inputSchema: {},
+  }, async () => text(status()));
+
+  server.registerTool('voice_speak', {
+    description: 'Say text in the voice room. Long text streams sentence by sentence.',
+    inputSchema: { text: z.string().min(1) },
+  }, async ({ text: spoken }) => {
+    if (!state.host) return text('voice host is not running; call voice_start');
+    await state.host.speak(spoken);
+    return text('spoken');
+  });
+
+  server.registerTool('voice_heard', {
+    description: 'Recent utterances transcribed from the room, oldest first.',
+    inputSchema: { since: z.number().optional().describe('only utterances after this epoch ms') },
+  }, async ({ since = 0 }) => text(JSON.stringify(state.heard.filter((u) => u.at > since), null, 2)));
+
+  await server.connect(new StdioServerTransport());
+  log('ccv MCP server ready');
+
+  const shutdown = async () => { await stop().catch(() => {}); process.exit(0); };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
