@@ -25,6 +25,9 @@ const subscriptions = new Set();
 // Calls of voice_listen still waiting for speech, so a client that never receives channel
 // notifications can be woken by an utterance instead of polling voice_heard.
 const listeners = new Set();
+// Utterances are ordered by this, not by their millisecond timestamp: two spoken in the same
+// millisecond would otherwise tie, and a cursor taken from either one would skip the other.
+let heardSeq = 0;
 
 // Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
@@ -88,8 +91,16 @@ function text(message) {
 // Hands an utterance to every waiting voice_listen call; one that asked for a newer cursor stays waiting.
 function wakeListeners(utterance) {
   for (const listener of listeners) {
-    if (utterance.at > listener.after) listener.deliver(utterance);
+    if (utterance.seq > listener.afterSeq) listener.deliver(utterance);
   }
+}
+
+// The cursor a voice_listen call waits from: the last utterance the caller handled, as a seq
+// where it has one and as an epoch ms otherwise, defaulting to everything heard so far.
+function cursorSeq(afterSeq, after) {
+  if (afterSeq !== undefined) return afterSeq;
+  if (after === undefined) return state.heard.at(-1)?.seq ?? 0;
+  return state.heard.findLast((u) => u.at <= after)?.seq ?? 0;
 }
 
 // Starts the install once; later calls share its promise.
@@ -188,7 +199,7 @@ function startHostChild(config) {
       if (msg.type === 'ready') resolve({ child, url: msg.url, speak: (t) => speakVia(child, pendingSpeech, () => nextId++, t) });
       if (msg.type === 'error') reject(new Error(msg.message));
       if (msg.type === 'heard') {
-        const utterance = { at: msg.at, from: msg.from, text: msg.text };
+        const utterance = { seq: ++heardSeq, at: msg.at, from: msg.from, text: msg.text };
         state.heard.push(utterance);
         if (state.heard.length > HEARD_KEEP) state.heard.shift();
         // Durable fallback for clients that do not deliver channel notifications:
@@ -364,25 +375,30 @@ export async function main() {
   // For sessions that never registered the channel handler, this is the push path: the call
   // blocks until the user speaks, so a reply needs no polling loop to notice them.
   server.registerTool('voice_listen', {
-    description: 'Wait for the next utterance in the room and return it, or {"timeout":true} after timeoutMs. Use this when speech does not arrive by itself; call it again after each reply to keep listening.',
+    description: 'Wait for the next utterance in the room and return it, or {"timeout":true} after timeoutMs. Use this when speech does not arrive by itself; call it again after each reply, passing back afterSeq, to keep listening.',
     inputSchema: {
-      after: z.number().optional().describe('only utterances after this epoch ms; defaults to everything heard so far'),
+      afterSeq: z.number().optional().describe('the seq of the last utterance you handled; only newer ones are returned'),
+      after: z.number().optional().describe('epoch ms of the last utterance you saw, used when afterSeq is absent'),
       timeoutMs: z.number().optional().describe('give up after this long in ms (default 30000, max 300000)'),
     },
-  }, async ({ after, timeoutMs = 30000 }, extra) => {
-    const cursor = after ?? state.heard.at(-1)?.at ?? 0;
-    const waiting = state.heard.find((u) => u.at > cursor);
+  }, async ({ afterSeq, after, timeoutMs = 30000 }, extra) => {
+    const cursor = cursorSeq(afterSeq, after);
+    const waiting = state.heard.find((u) => u.seq > cursor);
     if (waiting) return text(JSON.stringify(waiting));
+    if (extra?.signal?.aborted) return text(JSON.stringify({ cancelled: true, afterSeq: cursor }));
     return new Promise((resolve) => {
       const give = Math.min(Math.max(timeoutMs, 1000), 300000);
-      const listener = { after: cursor, deliver: (u) => { stop(); resolve(text(JSON.stringify(u))); } };
+      const listener = { afterSeq: cursor, deliver: (u) => { stop(); resolve(text(JSON.stringify(u))); } };
       function stop() {
         clearTimeout(timer);
         listeners.delete(listener);
         extra?.signal?.removeEventListener('abort', cancel);
       }
-      const timer = setTimeout(() => { stop(); resolve(text(JSON.stringify({ timeout: true, after: cursor }))); }, give);
-      const cancel = () => { stop(); resolve(text(JSON.stringify({ cancelled: true, after: cursor }))); };
+      const timer = setTimeout(() => {
+        stop();
+        resolve(text(JSON.stringify({ timeout: true, afterSeq: cursor, newestSeq: state.heard.at(-1)?.seq ?? 0 })));
+      }, give);
+      const cancel = () => { stop(); resolve(text(JSON.stringify({ cancelled: true, afterSeq: cursor }))); };
       listeners.add(listener);
       extra?.signal?.addEventListener('abort', cancel, { once: true });
     });

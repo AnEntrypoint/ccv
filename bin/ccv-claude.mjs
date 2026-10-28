@@ -6,7 +6,13 @@ import { spawn } from 'node:child_process';
 
 const server = process.env.CCV_SERVER_NAME ?? 'ccv';
 const args = ['--dangerously-load-development-channels', `server:${server}`, ...process.argv.slice(2)];
-const child = spawn('claude', args, { stdio: 'inherit', shell: process.platform === 'win32' });
+
+// Reaching claude.cmd on Windows needs a shell, and a shell re-splits the command line, so every
+// argument is quoted for cmd. Elsewhere spawn passes the arguments through untouched.
+const child = process.platform === 'win32'
+  ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', `claude ${args.map((a) => `"${a.replace(/"/g, '""')}"`).join(' ')}`], { stdio: 'inherit' })
+  : spawn('claude', args, { stdio: 'inherit' });
+
 child.on('error', (err) => {
   console.error(`ccv-claude: could not run claude: ${err.message}`);
   process.exit(1);
