@@ -287,14 +287,14 @@ export async function main() {
   });
   notifyHeard = (utterance) => {
     // Standard resource notification: clients subscribed to ccv://heard re-read the list.
-    if (subscriptions.has(HEARD_URI)) server.server.sendResourceUpdated({ uri: HEARD_URI }).catch(() => {});
+    if (subscriptions.has(HEARD_URI)) server.server.sendResourceUpdated({ uri: HEARD_URI }).catch((err) => log(`resource notify failed: ${err.message}`));
     // Standard logging notification: any MCP client that renders logs gets it.
-    server.sendLoggingMessage({ level: 'notice', logger: 'ccv', data: utterance }).catch(() => {});
+    server.sendLoggingMessage({ level: 'notice', logger: 'ccv', data: utterance }).catch((err) => log(`logging notify failed: ${err.message}`));
     // Claude Code channel push: clients that do not declare claude/channel ignore it.
     server.server.notification({
       method: 'notifications/claude/channel',
       params: { content: utterance.text, meta: { from: utterance.from, at: String(utterance.at) } },
-    }).catch(() => {});
+    }).then(() => log(`channel notify sent: ${utterance.text}`), (err) => log(`channel notify failed: ${err.message}`));
   };
 
   server.registerTool('voice_setup', {
