@@ -261,11 +261,22 @@ export async function main() {
   if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
   ensureSetup().catch(() => {});
 
-  const server = new McpServer({ name: 'ccv', version: '0.1.0' }, { capabilities: { experimental: { 'claude/channel': {} } } });
-  notifyHeard = ({ at, from, text: heard }) => server.server.notification({
-    method: 'notifications/claude/channel',
-    params: { content: heard, meta: { source: 'ccv', from, at: String(at) } },
-  }).catch(() => {});
+  const server = new McpServer(
+    { name: 'ccv', version: '0.1.0' },
+    {
+      capabilities: { logging: {}, experimental: { 'claude/channel': {} } },
+      instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> and are spoken by the user in the voice room. Reply with voice_speak.',
+    },
+  );
+  notifyHeard = (utterance) => {
+    // Standard logging notification: any MCP client that renders logs gets it.
+    server.sendLoggingMessage({ level: 'notice', logger: 'ccv', data: utterance }).catch(() => {});
+    // Claude Code channel push: clients that do not declare claude/channel ignore it.
+    server.server.notification({
+      method: 'notifications/claude/channel',
+      params: { content: utterance.text, meta: { from: utterance.from, at: String(utterance.at) } },
+    }).catch(() => {});
+  };
 
   server.registerTool('voice_setup', {
     description: 'Install LiveKit and download the speech models in the background. Runs automatically at launch; use this only to retry after an error.',
