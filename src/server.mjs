@@ -25,6 +25,8 @@ const subscriptions = new Set();
 
 // Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
+// Same channel, fired when a spoken reply finishes playing rather than when it is queued.
+let notifyDone = () => {};
 
 const state = {
   home: '',
@@ -189,6 +191,7 @@ function startHostChild(config) {
         pendingSpeech.delete(msg.id);
         if (done) msg.error ? done.reject(new Error(msg.error)) : done.resolve();
       }
+      if (msg.type === 'done') notifyDone(msg.at);
     });
     child.on('exit', (code) => {
       log(`host exited (${code})`);
@@ -298,6 +301,14 @@ export async function main() {
       method: 'notifications/claude/channel',
       params: { content: utterance.text, meta: { from: utterance.from, at: String(utterance.at) } },
     }).then(() => log(`channel notify sent: ${utterance.text}`), (err) => log(`channel notify failed: ${err.message}`));
+  };
+
+  notifyDone = (at) => {
+    server.sendLoggingMessage({ level: 'notice', logger: 'ccv', data: { event: 'done', at } }).catch((err) => log(`done notify failed: ${err.message}`));
+    server.server.notification({
+      method: 'notifications/claude/channel',
+      params: { content: 'voice reply finished', meta: { event: 'done', at: String(at) } },
+    }).then(() => log('done notify sent'), (err) => log(`done notify failed: ${err.message}`));
   };
 
   server.registerTool('voice_setup', {

@@ -90,7 +90,7 @@ function rawDbfs(pcm48) {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
-export async function startVoiceHost({ home, livekit, port, onHeard, log = console.log }) {
+export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, log = console.log }) {
   const [stt, tts] = await Promise.all([
     loadStt(modelDir(home, 'stt')),
     loadParadee(modelDir(home, 'tts')),
@@ -154,6 +154,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     if (id !== playbackId) it.return?.();
     if (id === playbackId) speakingUntil = Date.now() + ECHO_TAIL_MS;
     log(`speak: ${frames} frames, peak ${peak}, ${id === playbackId ? 'complete' : 'interrupted'}`);
+    if (id === playbackId) onSpoke?.();
   }
 
   function transcribeQueued(pcm) {

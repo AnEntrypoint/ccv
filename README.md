@@ -13,7 +13,7 @@ Add the server to Claude Code (`.mcp.json` in the project, or `claude mcp add cc
 
 Every utterance is also appended to `<CCV_HOME>/heard.jsonl` as one JSON object per line
 (`at`, `from`, `text`). Clients that do not deliver MCP channel notifications can follow that file instead.
-
+When a spoken reply finishes playing, the server sends the same channel notification with `event: done`.
 ## Configuration
 
 `.env` in the current directory is read at start. Process environment variables win over it.
