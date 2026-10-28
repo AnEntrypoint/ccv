@@ -157,15 +157,17 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     return job;
   }
 
-  async function handleUtterance(frames, identity) {
+  async function handleUtterance(frames, identity, wallMs = 0) {
     const total = frames.reduce((n, f) => n + f.length, 0);
     const pcm = new Int16Array(total);
     let off = 0;
     for (const f of frames) { pcm.set(f, off); off += f.length; }
     try {
+      const sttStarted = Date.now();
       const heard = (await transcribeQueued(pcm)).trim();
+      const sttMs = Date.now() - sttStarted;
       if (!heard) return;
-      log(`[${identity}] heard: ${heard}`);
+      log(`[${identity}] heard (${(total / STT_RATE).toFixed(1)} s audio, ${sttMs} ms stt, ${wallMs} ms wall): ${heard}`);
       onHeard?.(heard, identity);
     } catch (err) {
       log(`utterance failed: ${err.message}`);
@@ -177,6 +179,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
     const decimate = makeDecimator();
     const preRoll = [];
     let utter = null;
+    let utterStart = 0;
     let silent = 0;
     let voiced = 0;
     let bargeCount = 0;
@@ -202,11 +205,12 @@ export async function startVoiceHost({ home, livekit, port, onHeard, log = conso
         if (silent >= END_SILENCE_FRAMES) {
           const done = utter;
           utter = null;
-          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity);
+          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart);
           voiced = 0;
         }
       } else if (db >= ENERGY_DBFS) {
         utter = [...preRoll, pcm16k];
+        utterStart = Date.now();
         silent = 0;
         voiced = 1;
       }
