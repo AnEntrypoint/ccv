@@ -214,6 +214,7 @@ function startHostChild(config) {
         pendingSpeech.delete(msg.id);
         if (done) msg.error ? done.reject(new Error(msg.error)) : done.resolve();
       }
+      if (msg.type === 'speechend') appendFileSync(path.join(state.home, 'heard.jsonl'), `${JSON.stringify({ event: 'speechend', from: msg.from, at: msg.at })}\n`);
       if (msg.type === 'done') notifyDone(msg.at);
     });
     child.on('exit', (code) => {

@@ -3,18 +3,46 @@ import { Room, RoomEvent, Track } from 'https://esm.sh/livekit-client@2';
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $('status').textContent = s; };
-const TICK = 50, HOLD = 150, RESUME = 700;
-const PLAY_LOUD = -50, SPEECH_FLOOR = -42, CAL_MS = 350, FLOOR_MARGIN = 9, FLOOR_DECAY = 0.05;
+const TICK = 50, HOLD = 150, RESUME = 1200, REPORT_MS = 500;
+const PLAY_LOUD = -50, SPEECH_FLOOR = -42, CAL_MS = 350, FLOOR_MARGIN = 6, FLOOR_DECAY = 0.05, MIC_ECHO_DBFS = -55;
 const buf = new Float32Array(2048);
 let room, micPub, analyserCtx, micAnalyser, tickTimer;
 const playAnalysers = new Map();
-let overSince = 0, quietSince = 0, interrupted = false, playing = false, echoDb = -Infinity, calUntil = 0;
+const playStreams = new Map();
+const playGains = new Map();
+let overSince = 0, interrupted = false, playing = false, micSuppressed = false, echoDb = -Infinity, calUntil = 0, interruptedAt = 0, reportAt = 0;
+
+function ctx() {
+  if (!analyserCtx) analyserCtx = new AudioContext();
+  if (analyserCtx.state === 'suspended') analyserCtx.resume();
+  return analyserCtx;
+}
 
 function analyserFor(stream) {
-  const a = analyserCtx.createAnalyser();
+  const a = ctx().createAnalyser();
   a.fftSize = 2048;
-  analyserCtx.createMediaStreamSource(stream).connect(a);
+  ctx().createMediaStreamSource(stream).connect(a);
   return a;
+}
+
+// The element's own output, which is what the user actually hears. Tapping el.srcObject instead
+// reads silence in this client, so a reply could not be measured and barge-in never armed.
+// Routing the element through the graph also moves silencing here: el.muted no longer reaches it,
+// so cutting a reply dead has to be done on the gain.
+function analyserForElement(el) {
+  const a = ctx().createAnalyser();
+  a.fftSize = 2048;
+  const gain = ctx().createGain();
+  const src = ctx().createMediaElementSource(el);
+  src.connect(a);
+  src.connect(gain);
+  gain.connect(ctx().destination);
+  playGains.set(el, gain);
+  return a;
+}
+
+function silence(on) {
+  for (const g of playGains.values()) g.gain.setTargetAtTime(on ? 0 : 1, ctx().currentTime, 0.01);
 }
 
 function micTrack() {
@@ -30,19 +58,34 @@ function rmsDb(analyser) {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
+function setMicSending(on) {
+  const pub = room?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+  pub?.[on ? 'unmute' : 'mute']();
+}
+
 function interrupt() {
   if (interrupted) return;
   interrupted = true;
   overSince = 0;
-  quietSince = 0;
+  interruptedAt = performance.now();
   for (const el of $('audio').querySelectorAll('audio')) el.muted = true;
+  silence(true);
+  // Whatever the user says next is the point of the interrupt, so it has to reach the host.
+  setMicSending(true);
   fetch('/interrupt', { method: 'POST' }).catch(() => {});
 }
 
+// Unmute on the clock, not on a level: a muted element reads as silent, so measuring whether the
+// host has stopped would answer its own question and unmute straight into the buffered tail.
 function restore() {
   interrupted = false;
-  quietSince = 0;
   for (const el of $('audio').querySelectorAll('audio')) el.muted = false;
+  silence(false);
+}
+
+function report(state, micDb, playbackDb, gate, streamDb) {
+  const r = (d) => (Number.isFinite(d) ? Math.round(d) : -100);
+  fetch('/levels', { method: 'POST', body: JSON.stringify({ b: 3, s: state, m: r(micDb), p: r(playbackDb), ps: r(streamDb), g: r(gate) }) }).catch(() => {});
 }
 
 function tick() {
@@ -50,48 +93,59 @@ function tick() {
   let playbackDb = -Infinity;
   for (const a of playAnalysers.values()) playbackDb = Math.max(playbackDb, rmsDb(a));
   const micDb = micAnalyser ? rmsDb(micAnalyser) : -Infinity;
+  let gate = -Infinity;
   if (playbackDb > PLAY_LOUD) {
     // The gate is what the mic hears while the user is silent: echo-cancelled silence on a
     // headset, or near our own level on a speaker, so it is measured rather than assumed.
     if (!playing) { playing = true; echoDb = -Infinity; calUntil = now + CAL_MS; }
     if (now < calUntil) echoDb = Math.max(echoDb, micDb);
-    else if (micDb > Math.max(SPEECH_FLOOR, echoDb + FLOOR_MARGIN)) {
-      if (!overSince) overSince = now;
-      if (now - overSince >= HOLD) interrupt();
-    } else {
-      // Rising tracks echo peaks; the slow decay forgets a one-off louder moment.
-      echoDb = Math.max(micDb, echoDb - FLOOR_DECAY);
-      overSince = 0;
+    else {
+      gate = Math.max(SPEECH_FLOOR, echoDb + FLOOR_MARGIN);
+      if (micDb > gate) {
+        if (!overSince) overSince = now;
+        if (now - overSince >= HOLD) interrupt();
+      } else {
+        // Rising tracks echo peaks; the slow decay forgets a one-off louder moment.
+        echoDb = Math.max(micDb, echoDb - FLOOR_DECAY);
+        overSince = 0;
+      }
     }
   } else {
     playing = false;
     overSince = 0;
   }
-  if (interrupted) {
-    if (playbackDb > PLAY_LOUD) quietSince = 0;
-    else if (!quietSince) quietSince = now;
-    if (quietSince && now - quietSince >= RESUME) restore();
+  // A mic that hears the reply sends it back to the host, which transcribes our own words and
+  // answers them: stop sending while we play, but only when this room really does echo, so a
+  // headset user keeps every word of the sentence they speak over.
+  const suppress = playing && echoDb > MIC_ECHO_DBFS;
+  if (suppress !== micSuppressed) { micSuppressed = suppress; setMicSending(!suppress); }
+  if (interrupted && now - interruptedAt >= RESUME) restore();
+  if (now - reportAt >= REPORT_MS) {
+    reportAt = now;
+    let streamDb = -Infinity;
+    for (const a of playStreams.values()) streamDb = Math.max(streamDb, rmsDb(a));
+    report(interrupted ? 'interrupted' : playing ? 'playing' : playAnalysers.size ? 'idle' : 'no-mic', micDb, playbackDb, gate, streamDb);
   }
 }
 
 function teardown() {
   clearInterval(tickTimer);
   tickTimer = 0;
-  analyserCtx?.close();
-  analyserCtx = null;
   micAnalyser = null;
   micPub = null;
   playAnalysers.clear();
+  playStreams.clear();
+  playGains.clear();
   overSince = 0;
-  quietSince = 0;
   interrupted = false;
+  interruptedAt = 0;
+  micSuppressed = false;
 }
 
 async function join() {
   $('join').disabled = true;
   setStatus('connecting');
-  analyserCtx = new AudioContext();
-  analyserCtx.resume();
+  ctx();
   const identity = `browser-${Math.random().toString(36).slice(2, 7)}`;
   const { url, token } = await (await fetch(`/token?identity=${identity}`)).json();
   // Browser echo cancellation removes the host's own voice from the mic, so barge-in hears only the user.
@@ -103,8 +157,10 @@ async function join() {
     el.dataset.from = participant.identity;
     el.muted = interrupted;
     $('audio').appendChild(el);
-    // Tap el.srcObject, not the element: createMediaElementSource would reroute its audio and silence the speaker.
-    playAnalysers.set(el, analyserFor(el.srcObject));
+    // The element's own output is what the speakers get, and it is the only signal that
+    // matches what the user hears: el.srcObject reads silence in this client.
+    playAnalysers.set(el, analyserForElement(el));
+    try { if (el.srcObject) playStreams.set(el, analyserFor(el.srcObject)); } catch { /* not measured */ }
     setStatus(`hearing ${participant.identity}`);
   });
   room.on(RoomEvent.Disconnected, () => { teardown(); setStatus('disconnected'); $('join').disabled = false; $('leave').disabled = true; $('interrupt').disabled = true; });

@@ -112,7 +112,7 @@ function rawDbfs(pcm48) {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
-export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, log = console.log }) {
+export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd, onSpoke, log = console.log }) {
   const [stt, tts] = await Promise.all([
     loadStt(modelDir(home, 'stt')),
     loadParadee(modelDir(home, 'tts')),
@@ -245,7 +245,10 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
           utter = null;
           utterPeakDb = -Infinity;
           utterFloorDb = Infinity;
-          if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity, Date.now() - utterStart, peak, room);
+          if (voiced >= MIN_SPEECH_FRAMES) {
+            onSpeechEnd?.(identity, Date.now());
+            handleUtterance(done, identity, Date.now() - utterStart, peak, room);
+          }
           voiced = 0;
         }
       } else if (db >= openDb) {
@@ -285,6 +288,14 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpoke, lo
       return res.end(JSON.stringify({ url: livekit.url, token: await browser.toJwt() }));
     }
     if (req.method === 'GET' && url.pathname === '/health') return res.end('ok');
+    // Level report from the page, so what it measures about its own mic and playback is visible
+    // in the host log instead of being inferred from the audio that comes out the other end.
+    if (req.method === 'POST' && url.pathname === '/levels') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      log(`levels ${body}`);
+      return res.end('ok');
+    }
     // A client that can see and silence its own playback decides barge-in locally and calls this:
     // it beats the energy gate above, which a normal microphone cannot clear under our own voice.
     if (req.method === 'POST' && url.pathname === '/interrupt') {

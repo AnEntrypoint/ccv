@@ -21,6 +21,7 @@ try {
     port: config.port,
     log,
     onHeard: (text, identity) => send({ type: 'heard', text, from: identity, at: Date.now() }),
+    onSpeechEnd: (identity, at) => send({ type: 'speechend', from: identity, at }),
     onSpoke: () => send({ type: 'done', at: Date.now() }),
   });
   send({ type: 'ready', url: host.url });
