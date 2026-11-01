@@ -59,7 +59,7 @@ export function prosody(pcm) {
   const x = toAnalysisRate(pcm);
   const frames = [];
   for (let off = 0; off + WIN <= x.length; off += HOP) frames.push({ off, db: frameDb(x, off) });
-  const empty = { durationMs, levelDb: null, peakDb: null, f0Hz: null, f0SpreadSt: null, voicedShare: 0 };
+  const empty = { durationMs, speechMs: null, levelDb: null, peakDb: null, f0Hz: null, f0SpreadSt: null, voicedShare: 0 };
   if (!frames.length) return empty;
   const peakDb = Math.max(...frames.map((f) => f.db));
   if (peakDb < SILENCE_DB) return { ...empty, peakDb: round(peakDb, 1) };
@@ -71,8 +71,11 @@ export function prosody(pcm) {
   }
   const semitones = hz.map((h) => 12 * Math.log2(h));
   const spread = semitones.length >= 3 ? Math.sqrt(mean(semitones.map((s) => (s - mean(semitones)) ** 2))) : null;
+  // Speech span: first to last speech frame, so trailing silence the recorder adds is not counted in the cadence.
+  const speechMs = Math.round(((speech.at(-1).off + WIN - speech[0].off) * 1000) / RATE);
   return {
     durationMs,
+    speechMs,
     levelDb: round(mean(speech.map((f) => f.db)), 1),
     peakDb: round(peakDb, 1),
     f0Hz: hz.length ? round(median(hz)) : null,
@@ -87,7 +90,8 @@ export function prosody(pcm) {
 const LOUD_DB = 4;
 const PITCH_RATIO = 1.15;
 const SPREAD_ST = 1.5;
-const TYPICAL_SPEECH = { levelDb: -26.4, f0Hz: 122, f0SpreadSt: 2.5 }; // medians of recorded Discord utterances
+const RATE_RATIO = 1.25;
+const TYPICAL_SPEECH = { levelDb: -26.4, f0Hz: 122, f0SpreadSt: 2.5, wordsPerSec: 3.0 }; // medians of recorded Discord utterances
 const SEED_COUNT = 3;
 export function toneWords(p, past) {
   const history = [...Array(SEED_COUNT).fill(TYPICAL_SPEECH), ...past];
@@ -106,6 +110,11 @@ export function toneWords(p, past) {
     const spread = p.f0SpreadSt - median(history.filter((q) => q.f0SpreadSt !== null).map((q) => q.f0SpreadSt));
     if (spread >= SPREAD_ST) words.push('animated');
     else if (spread <= -SPREAD_ST) words.push('flat');
+  }
+  if (p.wordsPerSec) {
+    const rate = p.wordsPerSec / median(history.filter((q) => q.wordsPerSec).map((q) => q.wordsPerSec));
+    if (rate >= RATE_RATIO) words.push('fast');
+    else if (rate <= 1 / RATE_RATIO) words.push('slow');
   }
   return words.length ? words.join(' ') : 'neutral';
 }
