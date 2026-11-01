@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@echogarden/espeak-ng-emscripten": "^0.3.5",
+    "@jitsi/rnnoise-wasm": "^0.2.1",
     "@livekit/rtc-node": "^1.2.1",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "livekit-server-sdk": "^2.19.2",
