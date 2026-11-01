@@ -29,6 +29,8 @@ const listeners = new Set();
 // Utterances are ordered by this, not by their millisecond timestamp: two spoken in the same
 // millisecond would otherwise tie, and a cursor taken from either one would skip the other.
 let heardSeq = 0;
+// Last seq that voice_listen handed out; a caller's stale cursor can never replay an utterance at or below it.
+let listenedSeq = 0;
 
 // Pushes each utterance into the Claude session as a channel event as it arrives; set once the MCP server exists.
 let notifyHeard = () => {};
@@ -89,11 +91,16 @@ function text(message) {
   return { content: [{ type: 'text', text: message }] };
 }
 
-// Hands an utterance to every waiting voice_listen call; one that asked for a newer cursor stays waiting.
+// Hands an utterance to the first waiting voice_listen call behind it. The handout moves listenedSeq past it, so the rest keep waiting.
 function wakeListeners(utterance) {
   for (const listener of listeners) {
-    if (utterance.seq > listener.afterSeq) listener.deliver(utterance);
+    if (utterance.seq > listener.afterSeq && utterance.seq > listenedSeq) listener.deliver(utterance);
   }
+}
+
+function handOut(utterance) {
+  listenedSeq = utterance.seq;
+  return text(JSON.stringify(utterance));
 }
 
 // The cursor a voice_listen call waits from: the last utterance the caller handled, as a seq
@@ -300,7 +307,7 @@ export async function main() {
     { name: 'ccv', version: '0.1.0' },
     {
       capabilities: { logging: {}, resources: { subscribe: true }, experimental: { 'claude/channel': {} } },
-      instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> and are spoken by the user in the voice room. Reply with voice_speak. If they never arrive, the session was started without --dangerously-load-development-channels server:ccv; call voice_listen instead, which blocks until the user speaks.',
+      instructions: 'Voice utterances arrive as <channel source="ccv" from="..." at="..."> events, spoken by the user in the voice room. Reply with voice_speak, or make no tool call when quiet. Never call voice_listen while channel events arrive; it is only for sessions where none arrive, and blocks until the user speaks.',
     },
   );
   server.registerResource(
@@ -394,20 +401,21 @@ export async function main() {
   // For sessions that never registered the channel handler, this is the push path: the call
   // blocks until the user speaks, so a reply needs no polling loop to notice them.
   server.registerTool('voice_listen', {
-    description: 'Wait for the next utterance in the room and return it, or {"timeout":true} after timeoutMs. Use this when speech does not arrive by itself; call it again after each reply, passing back afterSeq, to keep listening.',
+    description: 'Fallback for sessions with no channel events: block until the next utterance in the room, return it once, or {"timeout":true} after timeoutMs. Call again after each reply, passing back afterSeq.',
     inputSchema: {
-      afterSeq: z.number().optional().describe('the seq of the last utterance you handled; only newer ones are returned'),
-      after: z.number().optional().describe('epoch ms of the last utterance you saw, used when afterSeq is absent'),
+      afterSeq: z.number().optional().describe('seq you last handled; older or already returned ones are skipped'),
+      after: z.number().optional().describe('epoch ms you last saw, used when afterSeq is absent'),
       timeoutMs: z.number().optional().describe('give up after this long in ms (default 30000, max 300000)'),
     },
   }, async ({ afterSeq, after, timeoutMs = 30000 }, extra) => {
-    const cursor = cursorSeq(afterSeq, after);
+    const explicit = afterSeq !== undefined || after !== undefined;
+    const cursor = explicit ? Math.max(cursorSeq(afterSeq, after), listenedSeq) : (listenedSeq || cursorSeq());
     const waiting = state.heard.find((u) => u.seq > cursor);
-    if (waiting) return text(JSON.stringify(waiting));
+    if (waiting) return handOut(waiting);
     if (extra?.signal?.aborted) return text(JSON.stringify({ cancelled: true, afterSeq: cursor }));
     return new Promise((resolve) => {
       const give = Math.min(Math.max(timeoutMs, 1000), 300000);
-      const listener = { afterSeq: cursor, deliver: (u) => { stop(); resolve(text(JSON.stringify(u))); } };
+      const listener = { afterSeq: cursor, deliver: (u) => { stop(); resolve(handOut(u)); } };
       function stop() {
         clearTimeout(timer);
         listeners.delete(listener);
