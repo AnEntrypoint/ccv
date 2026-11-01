@@ -82,23 +82,28 @@ export function prosody(pcm) {
 }
 
 // Tone words for channel metadata: how this utterance sits against the same speaker's recent utterances (past).
-// Needs three earlier utterances with pitch and level; otherwise, or when nothing stands out, it says neutral.
+// Until a speaker has history, the typical speech profile stands in for it, so early utterances already read.
+// Each axis is judged on its own: a utterance with no clear pitch can still be loud. Nothing standing out is neutral.
 const LOUD_DB = 4;
 const PITCH_RATIO = 1.15;
 const SPREAD_ST = 1.5;
+const TYPICAL_SPEECH = { levelDb: -26.4, f0Hz: 122, f0SpreadSt: 2.5 }; // medians of recorded Discord utterances
+const SEED_COUNT = 3;
 export function toneWords(p, past) {
-  const known = past.filter((q) => q.levelDb !== null && q.f0Hz !== null);
-  if (known.length < 3 || p.levelDb === null || p.f0Hz === null) return 'neutral';
+  const history = [...Array(SEED_COUNT).fill(TYPICAL_SPEECH), ...past];
   const words = [];
-  const level = p.levelDb - median(known.map((q) => q.levelDb));
-  if (level >= LOUD_DB) words.push('loud');
-  else if (level <= -LOUD_DB) words.push('quiet');
-  const pitch = p.f0Hz / median(known.map((q) => q.f0Hz));
-  if (pitch >= PITCH_RATIO) words.push('high');
-  else if (pitch <= 1 / PITCH_RATIO) words.push('low');
-  const spreads = known.filter((q) => q.f0SpreadSt !== null).map((q) => q.f0SpreadSt);
-  if (p.f0SpreadSt !== null && spreads.length >= 3) {
-    const spread = p.f0SpreadSt - median(spreads);
+  if (p.levelDb !== null) {
+    const level = p.levelDb - median(history.filter((q) => q.levelDb !== null).map((q) => q.levelDb));
+    if (level >= LOUD_DB) words.push('loud');
+    else if (level <= -LOUD_DB) words.push('quiet');
+  }
+  if (p.f0Hz !== null) {
+    const pitch = p.f0Hz / median(history.filter((q) => q.f0Hz !== null).map((q) => q.f0Hz));
+    if (pitch >= PITCH_RATIO) words.push('high');
+    else if (pitch <= 1 / PITCH_RATIO) words.push('low');
+  }
+  if (p.f0SpreadSt !== null) {
+    const spread = p.f0SpreadSt - median(history.filter((q) => q.f0SpreadSt !== null).map((q) => q.f0SpreadSt));
     if (spread >= SPREAD_ST) words.push('animated');
     else if (spread <= -SPREAD_ST) words.push('flat');
   }
