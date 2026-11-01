@@ -3,6 +3,7 @@
 import * as ort from 'onnxruntime-node';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { availableParallelism } from 'node:os';
 
 const SR = 16000;
 const N_FFT = 512;
@@ -104,8 +105,11 @@ export function logMel(pcm) {
   return { mel, frames };
 }
 
+// Six threads measured fastest for this encoder on a 12-core machine; STT_THREADS overrides it, capped at the cores present.
+const sttThreads = Math.min(Number(process.env.STT_THREADS ?? 6), availableParallelism());
+
 export async function loadStt(modelDir) {
-  const opts = { executionProviders: ['cpu'], graphOptimizationLevel: 'all' };
+  const opts = { executionProviders: ['cpu'], graphOptimizationLevel: 'all', intraOpNumThreads: sttThreads, interOpNumThreads: 1 };
   const [encoder, decoder, joiner] = await Promise.all([
     ort.InferenceSession.create(path.join(modelDir, 'encoder.int8.onnx'), opts),
     ort.InferenceSession.create(path.join(modelDir, 'decoder.int8.onnx'), opts),
