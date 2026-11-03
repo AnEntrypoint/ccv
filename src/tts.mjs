@@ -8,6 +8,8 @@ import { phonemize } from './phonemize.mjs';
 export const SAMPLE_RATE = 24000;
 const MAX_PHONEMES = 510;
 const CHATTERBOX_URL = 'http://127.0.0.1:8765';
+const CHATTERBOX_MAX_WORDS = 72;
+const CLAUSE_BREAK = /[,;:—–-]$/;
 
 // Same sentence boundaries as paradee-web: after . ! ? or … followed by whitespace, and at newlines.
 export function splitSentences(text) {
@@ -58,9 +60,26 @@ function toPcm16(float) {
   return pcm;
 }
 
-async function* chatterboxBlocks(baseUrl, sentence) {
+function cutLength(words) {
+  for (let length = CHATTERBOX_MAX_WORDS; length > 0; length--) {
+    if (CLAUSE_BREAK.test(words[length - 1])) return length;
+  }
+  return CHATTERBOX_MAX_WORDS;
+}
+
+function chatterboxParts(text) {
+  const parts = [];
+  for (const sentence of splitSentences(text)) {
+    const words = sentence.split(/\s+/);
+    while (words.length > CHATTERBOX_MAX_WORDS) parts.push(words.splice(0, cutLength(words)).join(' '));
+    parts.push(words.join(' '));
+  }
+  return parts;
+}
+
+async function* chatterboxBlocks(baseUrl, part) {
   const url = new URL('/tts', baseUrl);
-  url.searchParams.set('text', sentence);
+  url.searchParams.set('text', part);
   url.searchParams.set('encoding', 'int16');
   const res = await fetch(url);
   if (!res.ok) throw new Error(`chatterbox ${res.status}`);
@@ -81,7 +100,7 @@ async function* chatterboxBlocks(baseUrl, sentence) {
 // Yields one Int16Array (24 kHz) per sentence, so playback can start before the text is finished.
 export async function* synthesizeStream(model, text, speed = 1.0) {
   if (model.chatterboxUrl) {
-    for (const sentence of splitSentences(text)) yield* chatterboxBlocks(model.chatterboxUrl, sentence);
+    for (const part of chatterboxParts(text)) yield* chatterboxBlocks(model.chatterboxUrl, part);
     return;
   }
   for (const sentence of splitSentences(text)) {
