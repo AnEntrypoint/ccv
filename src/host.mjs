@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { AccessToken } from 'livekit-server-sdk';
 import { AudioSource, AudioFrame, AudioStream, LocalAudioTrack, Room, RoomEvent, TrackKind, TrackPublishOptions, TrackSource } from '@livekit/rtc-node';
 import { loadStt, transcribePcm16k } from './stt.mjs';
-import { loadParadee, synthesizeStream, SAMPLE_RATE as TTS_RATE } from './tts.mjs';
+import { loadTts, synthesizeStream, SAMPLE_RATE as TTS_RATE } from './tts.mjs';
 import { modelDir } from './install.mjs';
 
 const WEB = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'stack', 'web');
@@ -115,7 +115,7 @@ function rawDbfs(pcm48) {
 export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd, onSpoke, log = console.log }) {
   const [stt, tts] = await Promise.all([
     loadStt(modelDir(home, 'stt')),
-    loadParadee(modelDir(home, 'tts')),
+    loadTts(modelDir(home, 'tts')),
   ]);
   log('speech models loaded');
 

@@ -44,6 +44,8 @@ The host keeps its own energy-based barge-in as a fallback for clients that cann
 | `LK_ROOM` | `lk-voice` | Room name |
 | `CCV_PORT` | `8800` | Voice page and host port (127.0.0.1) |
 | `CCV_HOME` | `./.ccv` | Where binaries and models live |
+| `TTS` | `paradee` | Speech engine: `paradee` (local ONNX) or `chatterbox` (Chatterbox-Nano server, 24 kHz) |
+| `CHATTERBOX_URL` | `http://127.0.0.1:8765` | Chatterbox-Nano server used when `TTS=chatterbox` |
 | `END_SILENCE_MS` | `800` | Quiet time that ends an utterance (debounce only, nothing is force-sent) |
 | `MIN_SPEECH_MS` | `250` | Shorter bursts (clicks, knocks) are dropped |
 | `BARGE_DBFS` / `BARGE_MS` | `-30` / `250` | Host fallback barge-in: level and duration that interrupt playback |
