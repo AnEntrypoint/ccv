@@ -112,10 +112,20 @@ function rawDbfs(pcm48) {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
-export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd, onSpoke, log = console.log }) {
-  const [stt, tts] = await Promise.all([
+export async function startVoiceHost({ home, livekit, port, engine, onHeard, onSpeechEnd, onSpoke, log = console.log }) {
+  const ttsModels = new Map();
+  function ttsModel(name) {
+    if (!ttsModels.has(name)) {
+      const loading = loadTts(modelDir(home, 'tts'), name);
+      ttsModels.set(name, loading);
+      loading.catch(() => ttsModels.delete(name));
+    }
+    return ttsModels.get(name);
+  }
+  let activeEngine = engine;
+  const [stt] = await Promise.all([
     loadStt(modelDir(home, 'stt')),
-    loadTts(modelDir(home, 'tts')),
+    ttsModel(engine),
   ]);
   log('speech models loaded');
 
@@ -150,8 +160,9 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd
   // Streams the reply sentence by sentence; the next sentence is synthesized while this one plays.
   async function speak(text) {
     if (!source) throw new Error('not connected to a room yet');
+    const model = await ttsModel(activeEngine);
     const id = ++playbackId;
-    const it = synthesizeStream(tts, text)[Symbol.asyncIterator]();
+    const it = synthesizeStream(model, text)[Symbol.asyncIterator]();
     let frames = 0;
     let peak = 0;
     let next = it.next();
@@ -177,6 +188,11 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd
     if (id === playbackId) speakingUntil = Date.now() + ECHO_TAIL_MS;
     log(`speak: ${frames} frames, peak ${peak}, ${id === playbackId ? 'complete' : 'interrupted'}`);
     if (id === playbackId) onSpoke?.();
+  }
+
+  async function setEngine(name) {
+    await ttsModel(name);
+    activeEngine = name;
   }
 
   function transcribeQueued(pcm) {
@@ -333,6 +349,7 @@ export async function startVoiceHost({ home, livekit, port, onHeard, onSpeechEnd
   return {
     url: `http://127.0.0.1:${port}/`,
     speak,
+    setEngine,
     interrupt: interruptPlayback,
     async close() {
       interruptPlayback();

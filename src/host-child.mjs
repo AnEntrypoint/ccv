@@ -1,6 +1,6 @@
 // Runs the voice host in a child process so native library output on stdout cannot corrupt the
-// MCP stdio stream. Parent sends {type:'speak', id, text} or {type:'interrupt'} and receives
-// {type:'ready'|'heard'|'spoke'|'done'|'error'|'log'}.
+// MCP stdio stream. Parent sends {type:'speak', id, text}, {type:'engine', id, engine} or {type:'interrupt'} and receives
+// {type:'ready'|'heard'|'spoke'|'engine'|'done'|'error'|'log'}.
 // Exits when the parent's IPC channel closes, so a dead MCP server never leaves the host holding its port.
 import { startVoiceHost } from './host.mjs';
 
@@ -19,6 +19,7 @@ try {
     home: config.home,
     livekit: config.livekit,
     port: config.port,
+    engine: config.engine,
     log,
     onHeard: (text, identity) => send({ type: 'heard', text, from: identity, at: Date.now() }),
     onSpeechEnd: (identity, at) => send({ type: 'speechend', from: identity, at }),
@@ -34,6 +35,14 @@ try {
         send({ type: 'spoke', id: msg.id });
       } catch (err) {
         send({ type: 'spoke', id: msg.id, error: err.message });
+      }
+    }
+    if (msg.type === 'engine') {
+      try {
+        await host.setEngine(msg.engine);
+        send({ type: 'engine', id: msg.id });
+      } catch (err) {
+        send({ type: 'engine', id: msg.id, error: err.message });
       }
     }
     if (msg.type === 'interrupt') host.interrupt();

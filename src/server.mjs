@@ -6,6 +6,7 @@
 //   voice_speak   say text in the room (streams per sentence)
 //   voice_interrupt  cut off the reply playing right now
 //   voice_heard   recent utterances the host transcribed
+//   voice_engine  show or switch the TTS engine (paradee or chatterbox)
 import { mkdirSync, appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -20,6 +21,7 @@ import { loadDotEnv } from './env.mjs';
 const HEARD_KEEP = 50;
 const LOG_KEEP = 200;
 const LIVEKIT_PORT = 7880;
+const TTS_ENGINES = ['paradee', 'chatterbox'];
 const HOST_CHILD = fileURLToPath(new URL('./host-child.mjs', import.meta.url));
 const HEARD_URI = 'ccv://heard';
 const subscriptions = new Set();
@@ -200,11 +202,16 @@ function startHostChild(config) {
     child.stdout.on('data', relay);
     child.stderr.on('data', relay);
     recordChildren();
-    const pendingSpeech = new Map();
+    const pending = new Map();
     let nextId = 0;
     child.on('message', (msg) => {
       if (msg.type === 'log') (noisy(msg.line) ? quietLog('host', msg.line) : log(`host: ${msg.line}`));
-      if (msg.type === 'ready') resolve({ child, url: msg.url, speak: (t) => speakVia(child, pendingSpeech, () => nextId++, t) });
+      if (msg.type === 'ready') resolve({
+        child,
+        url: msg.url,
+        speak: (t) => requestChild(child, pending, () => nextId++, { type: 'speak', text: t }),
+        setEngine: (engine) => requestChild(child, pending, () => nextId++, { type: 'engine', engine }),
+      });
       if (msg.type === 'error') reject(new Error(msg.message));
       if (msg.type === 'heard') {
         const utterance = { seq: ++heardSeq, at: msg.at, from: msg.from, text: msg.text };
@@ -216,9 +223,9 @@ function startHostChild(config) {
         wakeListeners(utterance);
         notifyHeard(utterance);
       }
-      if (msg.type === 'spoke') {
-        const done = pendingSpeech.get(msg.id);
-        pendingSpeech.delete(msg.id);
+      if (msg.type === 'spoke' || msg.type === 'engine') {
+        const done = pending.get(msg.id);
+        pending.delete(msg.id);
         if (done) msg.error ? done.reject(new Error(msg.error)) : done.resolve();
       }
       if (msg.type === 'speechend') appendFileSync(path.join(state.home, 'heard.jsonl'), `${JSON.stringify({ event: 'speechend', from: msg.from, at: msg.at })}\n`);
@@ -233,11 +240,11 @@ function startHostChild(config) {
   });
 }
 
-function speakVia(child, pending, nextId, spoken) {
+function requestChild(child, pending, nextId, message) {
   const id = nextId();
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    child.send({ type: 'speak', id, text: spoken });
+    child.send({ ...message, id });
   });
 }
 
@@ -261,7 +268,7 @@ async function start() {
   }
   const port = Number(process.env.CCV_PORT ?? 8800);
   if (await portOpen(port)) throw new Error(`port ${port} is already in use; set CCV_PORT to another port`);
-  const host = await startHostChild({ home: state.home, livekit, port });
+  const host = await startHostChild({ home: state.home, livekit, port, engine: state.engine });
   state.host = host;
   openPage(host.url);
   return `voice host running. Open ${host.url} and click join.`;
@@ -287,6 +294,7 @@ function status() {
     modelsReady: state.home ? modelsReady(state.home) : false,
     livekit: state.livekit ? 'running (started by ccv)' : process.env.LIVEKIT_URL ? 'external' : 'stopped',
     host: state.host ? state.host.url : 'stopped',
+    ttsEngine: state.engine,
     heard: state.heard.length,
     waitingListeners: listeners.size,
     channelHint: 'Speech reaches the session on its own only when Claude Code was started with --dangerously-load-development-channels server:ccv (the name after server: must match exactly, with no trailing character) and the startup dialog was accepted. Otherwise call voice_listen, which blocks until the user speaks.',
@@ -294,10 +302,22 @@ function status() {
   }, null, 2);
 }
 
+async function setEngine(engine) {
+  if (engine === state.engine) return;
+  if (engine === 'chatterbox') {
+    const { probeChatterbox } = await import('./tts.mjs');
+    await probeChatterbox();
+  }
+  if (state.host) await state.host.setEngine(engine);
+  log(`tts engine: ${engine}`);
+  state.engine = engine;
+}
+
 export async function main() {
   const cwd = process.cwd();
   const loaded = loadDotEnv(cwd);
   state.home = process.env.CCV_HOME ?? path.join(cwd, '.ccv');
+  state.engine = process.env.TTS || 'paradee';
   mkdirSync(state.home, { recursive: true });
   reapStaleChildren();
   if (loaded.length) log(`loaded from .env: ${loaded.join(', ')}`);
@@ -391,6 +411,14 @@ export async function main() {
     if (!state.host) return text('voice host is not running; call voice_start');
     state.host.child.send({ type: 'interrupt' });
     return text('interrupted');
+  });
+
+  server.registerTool('voice_engine', {
+    description: 'Show the TTS engine, or switch it with engine: paradee (default) or chatterbox (the Chatterbox-Nano server at CHATTERBOX_URL). A switch applies to the next voice_speak; speech already playing finishes on the engine it started with. A switch to chatterbox is rejected, and the engine kept, when that server does not answer.',
+    inputSchema: { engine: z.enum(TTS_ENGINES).optional().describe('engine to switch to; omit to read the current one') },
+  }, async ({ engine }) => {
+    if (engine !== undefined) await setEngine(engine);
+    return text(JSON.stringify({ engine: state.engine, available: TTS_ENGINES }));
   });
 
   server.registerTool('voice_heard', {

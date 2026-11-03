@@ -8,6 +8,7 @@ import { phonemize } from './phonemize.mjs';
 export const SAMPLE_RATE = 24000;
 const MAX_PHONEMES = 510;
 const CHATTERBOX_URL = 'http://127.0.0.1:8765';
+const CHATTERBOX_PROBE_MS = 5000;
 const CHATTERBOX_MAX_WORDS = 72;
 const CLAUSE_BREAK = /[,;:—–-]$/;
 
@@ -26,9 +27,12 @@ export async function loadParadee(modelDir) {
   return { session, vocab: new Map(Object.entries(cfg.vocab)) };
 }
 
-export async function loadTts(modelDir) {
-  const engine = process.env.TTS || 'paradee';
-  if (engine === 'chatterbox') return { chatterboxUrl: process.env.CHATTERBOX_URL || CHATTERBOX_URL };
+export function chatterboxUrl() {
+  return process.env.CHATTERBOX_URL || CHATTERBOX_URL;
+}
+
+export async function loadTts(modelDir, engine) {
+  if (engine === 'chatterbox') return { chatterboxUrl: chatterboxUrl() };
   if (engine === 'paradee') return loadParadee(modelDir);
   throw new Error(`unknown TTS engine: ${engine}`);
 }
@@ -77,17 +81,27 @@ function chatterboxParts(text) {
   return parts;
 }
 
-async function* chatterboxBlocks(baseUrl, part) {
+async function fetchChatterbox(baseUrl, text, init) {
   const url = new URL('/tts', baseUrl);
-  url.searchParams.set('text', part);
+  url.searchParams.set('text', text);
   url.searchParams.set('encoding', 'int16');
-  const res = await fetch(url);
+  const res = await fetch(url, init);
   if (!res.ok) throw new Error(`chatterbox ${res.status}`);
   const rate = res.headers.get('x-sample-rate');
   const encoding = res.headers.get('x-encoding');
   if (rate !== String(SAMPLE_RATE) || encoding !== 'int16le') {
     throw new Error(`unexpected chatterbox audio: ${encoding} at ${rate} Hz`);
   }
+  return res;
+}
+
+export async function probeChatterbox(baseUrl = chatterboxUrl()) {
+  const res = await fetchChatterbox(baseUrl, 'Ready.', { signal: AbortSignal.timeout(CHATTERBOX_PROBE_MS) });
+  await res.body.cancel();
+}
+
+async function* chatterboxBlocks(baseUrl, part) {
+  const res = await fetchChatterbox(baseUrl, part);
   let carry = Buffer.alloc(0);
   for await (const block of res.body) {
     const bytes = Buffer.concat([carry, block]);
