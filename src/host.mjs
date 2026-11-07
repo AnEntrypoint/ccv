@@ -1,9 +1,3 @@
-// Voice host: joins the LiveKit room, transcribes every remote mic and screen-audio track with
-// Underdog Bark (STT), speaks replies with Paradee (TTS), and serves the browser page.
-// Endpointing is energy-based with debounce only: an utterance ends after END_SILENCE_MS of quiet,
-// and never before it, so nothing is force-sent. Quiet is measured against the room's own floor and
-// the absolute thresholds are floors on that, so a noisy room still closes an utterance. Barge-in cuts
-// playback when the raw level stays loud.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -11,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { AccessToken } from 'livekit-server-sdk';
 import { AudioSource, AudioFrame, AudioStream, LocalAudioTrack, Room, RoomEvent, TrackKind, TrackPublishOptions, TrackSource } from '@livekit/rtc-node';
 import { loadStt, transcribePcm16k } from './stt.mjs';
+import { createDenoiser } from './denoise.mjs';
 import { loadTts, synthesizeStream, SAMPLE_RATE as TTS_RATE } from './tts.mjs';
 import { modelDir } from './install.mjs';
 
@@ -27,18 +22,11 @@ const ENERGY_DBFS = Number(process.env.ENERGY_DBFS ?? -40);
 const ENERGY_CONTINUE_DBFS = Number(process.env.ENERGY_CONTINUE_DBFS ?? -46);
 const BARGE_DBFS = Number(process.env.BARGE_DBFS ?? -30);
 const BARGE_FRAMES = Number(process.env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
-// Barge-in must beat our own playback by this many dB; a microphone that hears the
-// speaker (or a remote-desktop loopback) would otherwise cancel every reply on onset.
 const ECHO_MARGIN_DB = Number(process.env.ECHO_MARGIN_DB ?? 8);
-// A capture that never drops below the continue threshold (a noisy room, or a mic
-// that hears the speaker) would otherwise stay open forever and swallow every reply.
 const MAX_UTTERANCE_FRAMES = Number(process.env.MAX_UTTERANCE_MS ?? 15000) / CAPTURE_FRAME_MS;
 const PLAYBACK_REF_MS = 400;
 const MIN_SPEECH_FRAMES = Number(process.env.MIN_SPEECH_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(process.env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
-// Speech gates are measured against the room's own floor. In a noisy room an absolute
-// threshold sits below the noise, so nothing ever counts as silence and every utterance
-// runs to the cap, landing the transcript 15 seconds after it was spoken.
 const FLOOR_FRAMES = Number(process.env.FLOOR_MS ?? 800) / CAPTURE_FRAME_MS;
 const SPEECH_OVER_DB = Number(process.env.SPEECH_OVER_DB ?? 12);
 const CONTINUE_OVER_DB = Number(process.env.CONTINUE_OVER_DB ?? 6);
@@ -46,8 +34,6 @@ const SILENCE_DBFS = -100;
 const PRE_ROLL_FRAMES = 20;
 const ECHO_TAIL_MS = 800;
 
-// Windowed-sinc low-pass (7.2 kHz cutoff at 48 kHz, Hann window, 96 taps) so energy above 8 kHz
-// cannot fold into the speech band when decimating by 3.
 const LP_TAPS = 96;
 const LP_COEFFS = (() => {
   const fc = 7200 / CAPTURE_RATE;
@@ -63,7 +49,6 @@ const LP_COEFFS = (() => {
   return taps;
 })();
 
-// Per-track decimator: each track keeps its own filter history.
 function makeDecimator() {
   const history = new Float64Array(LP_TAPS);
   let pos = 0;
@@ -83,9 +68,6 @@ function makeDecimator() {
   };
 }
 
-// Quietest level of the last FLOOR_FRAMES, the room's own floor as this track hears it.
-// A track that sends digital silence would otherwise put -Infinity in the window and
-// collapse the gates back to the absolute thresholds.
 function makeFloor() {
   const levels = new Float64Array(FLOOR_FRAMES).fill(SILENCE_DBFS);
   let pos = 0;
@@ -96,7 +78,6 @@ function makeFloor() {
   };
 }
 
-// Level of one frame we are about to send, in dBFS on the 16-bit scale.
 function pcmDbfs(pcm16) {
   if (pcm16.length === 0) return -Infinity;
   let sum = 0;
@@ -134,8 +115,6 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
   let source;
   let sttChain = Promise.resolve();
 
-  // Levels of the audio just sent, so barge-in can be told apart from the microphone
-  // hearing our own playback through speakers or a remote desktop loopback.
   const playbackLevels = [];
   function notePlaybackLevel(db) {
     const now = Date.now();
@@ -149,7 +128,6 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
     return ref;
   }
 
-  // Cancels the current reply: drops queued audio and stops the speak loop.
   function interruptPlayback() {
     playbackId++;
     speakingUntil = 0;
@@ -157,7 +135,6 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
     source?.clearQueue();
   }
 
-  // Streams the reply sentence by sentence; the next sentence is synthesized while this one plays.
   async function speak(text) {
     if (!source) throw new Error('not connected to a room yet');
     const model = await ttsModel(activeEngine);
@@ -175,7 +152,6 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
       for (let i = 0; i < value.length; i += PER_TTS_FRAME) {
         if (id !== playbackId) break;
         const chunk = value.subarray(i, i + PER_TTS_FRAME);
-        // Fresh buffer per frame: AudioFrame sends its whole ArrayBuffer, so a subarray view would ship the wrong samples.
         const padded = new Int16Array(PER_TTS_FRAME);
         padded.set(chunk);
         notePlaybackLevel(pcmDbfs(padded));
@@ -221,6 +197,7 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
   async function listen(track, identity) {
     const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
     const decimate = makeDecimator();
+    const denoiser = await createDenoiser();
     const floor = makeFloor();
     const preRoll = [];
     let utter = null;
@@ -231,8 +208,9 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
     let voiced = 0;
     let bargeCount = 0;
     for await (const frame of stream) {
-      const pcm16k = decimate(frame.data);
-      const db = rawDbfs(frame.data);
+      const clean = denoiser.process(frame.data);
+      const pcm16k = decimate(clean);
+      const db = rawDbfs(clean);
       const floorDb = floor(db);
       const openDb = Math.max(ENERGY_DBFS, floorDb + SPEECH_OVER_DB);
       const continueDb = Math.max(ENERGY_CONTINUE_DBFS, floorDb + CONTINUE_OVER_DB);
@@ -304,16 +282,12 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
       return res.end(JSON.stringify({ url: livekit.url, token: await browser.toJwt() }));
     }
     if (req.method === 'GET' && url.pathname === '/health') return res.end('ok');
-    // Level report from the page, so what it measures about its own mic and playback is visible
-    // in the host log instead of being inferred from the audio that comes out the other end.
     if (req.method === 'POST' && url.pathname === '/levels') {
       let body = '';
       for await (const chunk of req) body += chunk;
       log(`levels ${body}`);
       return res.end('ok');
     }
-    // A client that can see and silence its own playback decides barge-in locally and calls this:
-    // it beats the energy gate above, which a normal microphone cannot clear under our own voice.
     if (req.method === 'POST' && url.pathname === '/interrupt') {
       interruptPlayback();
       log('interrupt: reply cleared by client');
@@ -338,7 +312,7 @@ export async function startVoiceHost({ home, livekit, port, engine, onHeard, onS
       try {
         res.setHeader('content-type', TYPES[path.extname(file)] ?? 'application/octet-stream');
         return res.end(await readFile(path.join(WEB, file)));
-      } catch { /* fall through to 404 */ }
+      } catch {}
     }
     res.statusCode = 404;
     res.end();
